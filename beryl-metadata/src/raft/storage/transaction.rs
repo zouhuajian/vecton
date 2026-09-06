@@ -2,10 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
 use super::{
-    decode_from_slice, encode_to_vec, standard, worker_key, AppMetadataRaftState, AuthorityBatch, ColumnFamily,
-    CreateFileReplayRecord, DetachedRoot, DetachedRootReclaimUpdate, Inode, InodeAllocation, InodeId, Instant,
-    MetadataError, MetadataResult, MountEntry, RecursiveMkdirEntry, RenameAtomicUpdate, RocksDBStorage, RouteEpoch,
-    WorkerInfo, WriteBatch, CF_DENTRIES, CF_DETACHED_ROOTS, CF_INODES, CF_META, CF_MOUNTS, CF_RAFT_STATE, CF_WORKERS,
+    decode_from_slice, encode_to_vec, standard, worker_key, AppMetadataRaftState, ColumnFamily, CreateFileReplayRecord,
+    DetachedRoot, DetachedRootReclaimUpdate, Inode, InodeAllocation, InodeId, Instant, MetadataError, MetadataResult,
+    MountEntry, RecursiveMkdirEntry, RenameAtomicUpdate, RocksDBStorage, RouteEpoch, WorkerInfo, WriteBatch,
+    CF_DENTRIES, CF_DETACHED_ROOTS, CF_INODES, CF_META, CF_MOUNTS, CF_RAFT_STATE, CF_WORKERS,
     CREATE_FILE_REPLAY_COUNT_KEY, CREATE_FILE_REPLAY_EXPIRY_PREFIX, DB, MAX_CREATE_FILE_REPLAY_RECORDS,
     NEXT_INODE_ID_KEY, RAFT_STATE_KEY,
 };
@@ -14,7 +14,7 @@ use rocksdb::{Direction, IteratorMode};
 impl RocksDBStorage {
     pub(super) fn commit_authority_batch(
         &self,
-        mut batch: AuthorityBatch,
+        mut batch: WriteBatch,
         raft_state: &AppMetadataRaftState,
     ) -> MetadataResult<()> {
         let generation = self.pin_generation()?;
@@ -25,7 +25,7 @@ impl RocksDBStorage {
         batch.put_cf(cf_raft_state, RAFT_STATE_KEY, state_data);
         let started = Instant::now();
         let result = db
-            .write(batch.0)
+            .write(batch)
             .map_err(|e| MetadataError::Internal(format!("Failed to commit authority batch: {e}")));
         crate::observe::record_raft_authority_commit(
             if result.is_ok() { "ok" } else { "error" },
@@ -142,7 +142,7 @@ impl RocksDBStorage {
 
         let mut batch = WriteBatch::default();
         Self::batch_put_worker(&mut batch, cf_workers, info)?;
-        self.commit_authority_batch(batch.into(), raft_state)
+        self.commit_authority_batch(batch, raft_state)
     }
 
     fn batch_put_inode(batch: &mut WriteBatch, cf: &ColumnFamily, inode: &Inode) -> MetadataResult<()> {
@@ -160,7 +160,7 @@ impl RocksDBStorage {
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let mut batch = WriteBatch::default();
         Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
-        self.commit_authority_batch(batch.into(), raft_state)
+        self.commit_authority_batch(batch, raft_state)
     }
 
     pub(crate) fn bootstrap_namespace_atomic(
@@ -185,7 +185,7 @@ impl RocksDBStorage {
             encode_to_vec(2u64, standard())
                 .map_err(|error| MetadataError::Internal(format!("Failed to serialize next_inode_id: {error}")))?,
         );
-        self.commit_authority_batch(batch.into(), raft_state)
+        self.commit_authority_batch(batch, raft_state)
     }
 
     fn create_file_batch(
@@ -359,7 +359,7 @@ impl RocksDBStorage {
         let cf_meta = Self::cf(db, CF_META)?;
         Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
         Self::batch_put_create_file_replay(db, cf_meta, &mut batch, replay_record, proposed_at_ms)?;
-        self.commit_authority_batch(batch.into(), raft_state)
+        self.commit_authority_batch(batch, raft_state)
     }
 
     fn create_dir_batch(
@@ -403,7 +403,7 @@ impl RocksDBStorage {
         let mut batch = self.create_dir_batch(parent_inode_id, name, inode, updated_parent)?;
         let cf_meta = Self::cf(db, CF_META)?;
         Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
-        self.commit_authority_batch(batch.into(), raft_state)
+        self.commit_authority_batch(batch, raft_state)
     }
 
     /// Atomically persist all missing components of one recursive mkdir command.
@@ -431,7 +431,7 @@ impl RocksDBStorage {
             );
         }
         Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
-        self.commit_authority_batch(batch.into(), raft_state)
+        self.commit_authority_batch(batch, raft_state)
     }
 
     fn delete_dentry_inode_batch(
@@ -465,7 +465,7 @@ impl RocksDBStorage {
     ) -> MetadataResult<()> {
         let _generation = self.pin_generation()?;
         let batch = self.delete_dentry_inode_batch(parent_inode_id, name, inode_id, updated_parent)?;
-        self.commit_authority_batch(batch.into(), raft_state)
+        self.commit_authority_batch(batch, raft_state)
     }
 
     /// Atomically hide a recursive-delete root and publish its durable marker.
@@ -498,7 +498,7 @@ impl RocksDBStorage {
             Self::encode_detached_root(&detached_root)?,
         );
 
-        self.commit_authority_batch(batch.into(), raft_state)
+        self.commit_authority_batch(batch, raft_state)
     }
 
     /// Atomically publish one validated, bounded detached-root reclamation.
@@ -532,7 +532,7 @@ impl RocksDBStorage {
             batch.delete_cf(cf_detached_roots, Self::encode_detached_root_key(root_inode_id));
         }
 
-        self.commit_authority_batch(batch.into(), raft_state)
+        self.commit_authority_batch(batch, raft_state)
     }
 
     fn rename_batch(&self, update: RenameAtomicUpdate<'_>) -> MetadataResult<WriteBatch> {
@@ -579,7 +579,7 @@ impl RocksDBStorage {
     ) -> MetadataResult<()> {
         let _generation = self.pin_generation()?;
         let batch = self.rename_batch(update)?;
-        self.commit_authority_batch(batch.into(), raft_state)
+        self.commit_authority_batch(batch, raft_state)
     }
 }
 

@@ -3,7 +3,7 @@
 
 //! RocksDB-backed Raft state machine store (openraft `RaftStateMachine` + snapshot I/O).
 
-use super::{durable_raft_write_options, AuthorityBatch};
+use super::durable_raft_write_options;
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{MountEntry, MountTable, MountTableState};
 use crate::observe;
@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::JoinError;
+use tokio_util::task::task_tracker::TaskTrackerToken;
 use tracing::info;
 use uuid::Uuid;
 
@@ -53,6 +54,8 @@ pub(crate) struct StateMachineStorage {
     state: Arc<RwLock<AppMetadataRaftState>>,
     read_view: Arc<MetadataReadView>,
     snapshot_install: Arc<SnapshotInstallTracker>,
+    // Drop after the storage owners so shutdown observes their release.
+    storage_task: TaskTrackerToken,
 }
 
 impl StateMachineStorage {
@@ -62,6 +65,7 @@ impl StateMachineStorage {
         state: Arc<RwLock<AppMetadataRaftState>>,
         read_view: Arc<MetadataReadView>,
         snapshot_install: Arc<SnapshotInstallTracker>,
+        storage_task: TaskTrackerToken,
     ) -> MetadataResult<Self> {
         clean_stale_snapshot_tmp(&storage)?;
         let current_snapshot = current_snapshot_path(&storage)?;
@@ -73,6 +77,7 @@ impl StateMachineStorage {
             state,
             read_view,
             snapshot_install,
+            storage_task,
         })
     }
 }
@@ -179,6 +184,7 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
             storage: Arc::clone(&self.storage),
             _state_machine: Arc::clone(&self.state_machine),
             _state: Arc::clone(&self.state),
+            storage_task: self.storage_task.clone(),
         }
     }
 
@@ -217,10 +223,13 @@ impl RaftStateMachine<MetadataRaftTypeConfig> for StateMachineStorage {
         let read_view = Arc::clone(&self.read_view);
         let meta = meta.clone();
         let signature = meta.signature();
-        let installed = tokio::task::spawn_blocking(move || {
-            install_snapshot_generation(&storage, &read_view, &meta, snapshot_path, std_file, incoming_token)
-        })
-        .await;
+        let installed = self
+            .storage_task
+            .task_tracker()
+            .spawn_blocking(move || {
+                install_snapshot_generation(&storage, &read_view, &meta, snapshot_path, std_file, incoming_token)
+            })
+            .await;
         let installed = match installed {
             Ok(Ok(installed)) => installed,
             Ok(Err(error)) => {
@@ -289,13 +298,19 @@ pub(crate) struct AppSnapshotBuilder {
     storage: Arc<RocksDBStorage>,
     _state_machine: Arc<AppRaftStateMachine>,
     _state: Arc<RwLock<AppMetadataRaftState>>,
+    // Detached builders must release their storage owners before shutdown completes.
+    storage_task: TaskTrackerToken,
 }
 
 impl RaftSnapshotBuilder<MetadataRaftTypeConfig> for AppSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<MetadataRaftTypeConfig>, StorageError<u64>> {
         let started = Instant::now();
         let storage = Arc::clone(&self.storage);
-        let built = tokio::task::spawn_blocking(move || build_snapshot_generation(&storage)).await;
+        let built = self
+            .storage_task
+            .task_tracker()
+            .spawn_blocking(move || build_snapshot_generation(&storage))
+            .await;
         let built = match built {
             Ok(Ok(built)) => built,
             Ok(Err(error)) => {
@@ -910,7 +925,7 @@ fn snapshot_join_error(signature: Option<SnapshotSignature<u64>>, error: JoinErr
 impl RocksDBStorage {
     pub(crate) fn commit_applied_state(&self, raft_state: &AppMetadataRaftState) -> MetadataResult<()> {
         let _generation = self.pin_generation()?;
-        self.commit_authority_batch(AuthorityBatch::default(), raft_state)
+        self.commit_authority_batch(WriteBatch::default(), raft_state)
     }
 
     /// Get Raft state (vote, last_purged, etc.).
@@ -974,6 +989,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
     use tokio::io::AsyncWriteExt;
+    use tokio_util::task::TaskTracker;
 
     fn committed_apply_test_store() -> (TempDir, Arc<RocksDBStorage>, StateMachineStorage) {
         let dir = TempDir::new().unwrap();
@@ -992,6 +1008,41 @@ mod tests {
             log_id: LogId::new(LeaderId::new(1, 1), index),
             payload: EntryPayload::Normal(command),
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_snapshot_storage_after_build_waiter_is_cancelled() {
+        let (dir, storage, mut store) = committed_apply_test_store();
+        storage
+            .bind_storage_identity(&test_storage_identity("shutdown", 1))
+            .unwrap();
+        store.apply([normal_entry(1, bootstrap_command())]).await.unwrap();
+        let tasks = store.storage_task.task_tracker().clone();
+        tasks.close();
+        let mut builder = store.get_snapshot_builder().await;
+        drop(store);
+
+        let mut drained = Box::pin(tasks.wait());
+        assert!(futures::poll!(drained.as_mut()).is_pending());
+
+        // Hold the production generation lock to keep the blocking snapshot IO unfinished.
+        let generation = storage.generation_write().unwrap();
+        let mut build = Box::pin(builder.build_snapshot());
+        assert!(futures::poll!(build.as_mut()).is_pending());
+        drop(build);
+        drop(builder);
+        assert!(futures::poll!(drained.as_mut()).is_pending());
+
+        let released = Arc::downgrade(&storage);
+        drop(generation);
+        drop(storage);
+        tokio::time::timeout(std::time::Duration::from_secs(5), drained)
+            .await
+            .expect("snapshot storage must drain after releasing the generation lock");
+
+        assert!(released.upgrade().is_none());
+        let reopened = RocksDBStorage::open_existing_for_start(dir.path()).expect("storage must reopen immediately");
+        assert!(reopened.get_snapshot_meta().unwrap().is_some());
     }
 
     fn bootstrap_command() -> Command {
@@ -1491,6 +1542,7 @@ mod tests {
                 state,
                 read_view,
                 Arc::new(SnapshotInstallTracker::default()),
+                TaskTracker::new().token(),
             )
         }
     }
