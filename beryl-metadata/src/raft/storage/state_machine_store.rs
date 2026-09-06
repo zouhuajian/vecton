@@ -3,7 +3,7 @@
 
 //! RocksDB-backed Raft state machine store (openraft `RaftStateMachine` + snapshot I/O).
 
-use super::{durable_raft_write_options, AuthorityBatch};
+use super::durable_raft_write_options;
 use crate::error::{MetadataError, MetadataResult};
 use crate::mount::{MountEntry, MountTable, MountTableState};
 use crate::observe;
@@ -910,7 +910,7 @@ fn snapshot_join_error(signature: Option<SnapshotSignature<u64>>, error: JoinErr
 impl RocksDBStorage {
     pub(crate) fn commit_applied_state(&self, raft_state: &AppMetadataRaftState) -> MetadataResult<()> {
         let _generation = self.pin_generation()?;
-        self.commit_authority_batch(AuthorityBatch::default(), raft_state)
+        self.commit_authority_batch(WriteBatch::default(), raft_state)
     }
 
     /// Get Raft state (vote, last_purged, etc.).

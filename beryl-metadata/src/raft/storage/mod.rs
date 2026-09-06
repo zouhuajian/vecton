@@ -43,7 +43,6 @@ use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, WriteOp
 use serde::{Deserialize, Serialize};
 pub(crate) use snapshot::{SnapshotFile, SnapshotInstallTracker};
 pub(crate) use state_machine_store::StateMachineStorage;
-use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -132,30 +131,6 @@ pub(crate) struct StorageIdentity {
 pub(crate) struct DetachedRoot {
     pub(crate) mount_id: MountId,
     pub(crate) detached_at_ms: u64,
-}
-
-/// One authoritative state-machine commit assembled before RocksDB publication.
-#[derive(Default)]
-pub(crate) struct AuthorityBatch(WriteBatch);
-
-impl Deref for AuthorityBatch {
-    type Target = WriteBatch;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for AuthorityBatch {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl From<WriteBatch> for AuthorityBatch {
-    fn from(batch: WriteBatch) -> Self {
-        Self(batch)
-    }
 }
 
 /// Inode identity reserved by a read-only allocator preparation.
