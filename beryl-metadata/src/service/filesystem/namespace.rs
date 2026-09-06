@@ -6,14 +6,15 @@
 use super::command::unexpected_raft_apply_success;
 use super::{validate_active_write_layout, Freshness, FsResult, MetadataFileSystem, RequestContext, RoutedFsWriteCtx};
 use crate::error::{MetadataError, MetadataResult};
-use crate::inode::{Inode, InodeData};
+use crate::inode::InodeAttrs;
+use crate::inode::{Inode, InodeKind};
 use crate::observe;
 use crate::path_resolver::PathResolver;
 use crate::raft::{ApplySuccess, Command};
 use crate::session_registry::{
     BeginCreateSession, BeginCreateSessionError, BeginCreateSessionInput, CreateFileOperationId, WriteOpeningError,
 };
-use beryl_types::fs::FileAttrs;
+
 use beryl_types::ids::InodeId;
 use beryl_types::layout::FileLayout;
 use beryl_types::{ContentGeneration, LeaseEpoch};
@@ -21,15 +22,13 @@ use std::sync::atomic::Ordering;
 
 pub(crate) struct CreateDirectoryArgs {
     pub(crate) path: String,
-    // Deferring wire conversion errors until after write admission preserves failure precedence.
-    pub(crate) parsed_attrs: Result<FileAttrs, MetadataError>,
     pub(crate) recursive: bool,
     pub(crate) freshness: Freshness,
 }
 
 pub(crate) struct CreateDirectoryOutput {
     pub(crate) inode_id: InodeId,
-    pub(crate) attrs: FileAttrs,
+    pub(crate) attrs: InodeAttrs,
 }
 
 pub(crate) struct RenameArgs {
@@ -53,14 +52,10 @@ impl MetadataFileSystem {
 
         let CreateDirectoryArgs {
             path,
-            parsed_attrs,
             recursive,
             freshness,
         } = args;
-        let attrs = match parsed_attrs {
-            Ok(attrs) => attrs,
-            Err(err) => return self.failure_from_path_error(ctx, &path, err),
-        };
+        let attrs = InodeAttrs::new();
         let path = match PathResolver::normalize(&path) {
             Ok(path) => path,
             Err(err) => return self.failure_from_path_error(ctx, &path, err),
@@ -110,7 +105,7 @@ impl MetadataFileSystem {
         &self,
         ctx: &RequestContext,
         path: &str,
-        attrs: FileAttrs,
+        attrs: InodeAttrs,
         freshness: Freshness,
     ) -> FsResult<CreateDirectoryOutput> {
         let resolved = match self.path_resolver.resolve_path(path) {
@@ -143,7 +138,7 @@ impl MetadataFileSystem {
         &self,
         ctx: &RequestContext,
         path: &str,
-        attrs: FileAttrs,
+        attrs: InodeAttrs,
         freshness: Freshness,
     ) -> FsResult<CreateDirectoryOutput> {
         let (mount_ctx, components) = match self.path_resolver.resolve_mount_components(path) {
@@ -247,8 +242,8 @@ impl MetadataFileSystem {
         };
         let expected_dst_lease_epoch = match dst_resolved.inode_id {
             Some(dst_inode_id) => match self.read_inode(dst_inode_id) {
-                Ok(Some(inode)) => match &inode.data {
-                    InodeData::File { lease_epoch, .. } => Some(lease_epoch.unwrap_or_default()),
+                Ok(Some(inode)) => match &inode.kind {
+                    InodeKind::File(crate::inode::FileData { lease_epoch, .. }) => Some(*lease_epoch),
                     _ => None,
                 },
                 Ok(None) => None,
@@ -405,7 +400,7 @@ impl MetadataFileSystem {
         match self.read_dentry(dst_parent_inode_id, dst_name) {
             Ok(Some(dst_inode_id)) => match self.read_inode(dst_inode_id) {
                 Ok(Some(inode)) => {
-                    let has_active_write = if inode.kind.is_file() {
+                    let has_active_write = if inode.file_type().is_file() {
                         self.has_active_write(dst_inode_id)
                     } else {
                         self.has_active_write_under(dst_inode_id)
@@ -701,7 +696,7 @@ impl MetadataFileSystem {
                     expected_mount_epoch: ctx.mount_epoch,
                     mount_root_inode_id: ctx.mount_root_inode_id,
                     relative_components,
-                    attrs: FileAttrs::new(),
+                    attrs: InodeAttrs::new(),
                     layout,
                 },
                 |success| match success {
@@ -726,7 +721,7 @@ impl MetadataFileSystem {
         let (inode_id, layout, lease_epoch, expires_at_ms, generation) = result;
         let session = match opening.activate(inode_id, lease_epoch, expires_at_ms, layout, generation) {
             Ok(session) => session,
-            Err(WriteOpeningError::Expired | WriteOpeningError::NotCurrent) => {
+            Err(WriteOpeningError::Expired | WriteOpeningError::NotCurrent | WriteOpeningError::TargetLimit) => {
                 return self.failure_from_error(
                     request_ctx,
                     MetadataError::Again(format!(
@@ -878,7 +873,7 @@ impl MetadataFileSystem {
             );
         }
         let expected_file_lease_epoch = match self.read_inode(expected_inode_id) {
-            Ok(Some(inode)) if inode.kind.is_file() => Some(Self::file_lease_epoch(&inode)),
+            Ok(Some(inode)) if inode.file_type().is_file() => Some(Self::file_lease_epoch(&inode)),
             Ok(Some(_)) => None,
             Ok(None) => {
                 return self.failure_from_error(
@@ -914,8 +909,8 @@ impl MetadataFileSystem {
 
     /// Read the persisted file fencing epoch used by delete apply preconditions.
     fn file_lease_epoch(inode: &Inode) -> LeaseEpoch {
-        match &inode.data {
-            InodeData::File { lease_epoch, .. } => lease_epoch.unwrap_or_default(),
+        match &inode.kind {
+            InodeKind::File(crate::inode::FileData { lease_epoch, .. }) => *lease_epoch,
             _ => LeaseEpoch::default(),
         }
     }
@@ -948,11 +943,16 @@ mod tests {
 
         for inode_id in [parent_inode_id, root_inode_id, nested_inode_id] {
             storage
-                .put_inode(&Inode::new_dir(inode_id, FileAttrs::new(), mount_id))
+                .put_inode(&Inode::new_dir(inode_id, InodeAttrs::new(), mount_id))
                 .unwrap();
         }
         storage
-            .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), mount_id))
+            .put_inode(&Inode::new_file(
+                file_inode_id,
+                InodeAttrs::new(),
+                mount_id,
+                beryl_types::FileLayout::new(4096),
+            ))
             .unwrap();
         storage.put_dentry(parent_inode_id, "root", root_inode_id).unwrap();
         storage.put_dentry(root_inode_id, "nested", nested_inode_id).unwrap();
@@ -1001,10 +1001,15 @@ mod tests {
             .build();
 
         storage
-            .put_inode(&Inode::new_dir(ROOT_INODE_ID, FileAttrs::new(), mount_id))
+            .put_inode(&Inode::new_dir(ROOT_INODE_ID, InodeAttrs::new(), mount_id))
             .unwrap();
         storage
-            .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), mount_id))
+            .put_inode(&Inode::new_file(
+                file_inode_id,
+                InodeAttrs::new(),
+                mount_id,
+                beryl_types::FileLayout::new(4096),
+            ))
             .unwrap();
         storage.put_dentry(ROOT_INODE_ID, "file", file_inode_id).unwrap();
         storage.put_layout(file_inode_id, FileLayout::new(64)).unwrap();
@@ -1069,11 +1074,16 @@ mod tests {
 
         for inode_id in [parent_inode_id, source_inode_id, nested_inode_id] {
             storage
-                .put_inode(&Inode::new_dir(inode_id, FileAttrs::new(), mount_id))
+                .put_inode(&Inode::new_dir(inode_id, InodeAttrs::new(), mount_id))
                 .unwrap();
         }
         storage
-            .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), mount_id))
+            .put_inode(&Inode::new_file(
+                file_inode_id,
+                InodeAttrs::new(),
+                mount_id,
+                beryl_types::FileLayout::new(4096),
+            ))
             .unwrap();
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(source_inode_id, "nested", nested_inode_id).unwrap();
@@ -1130,11 +1140,16 @@ mod tests {
 
         for inode_id in [parent_inode_id, source_inode_id, target_inode_id, nested_inode_id] {
             storage
-                .put_inode(&Inode::new_dir(inode_id, FileAttrs::new(), mount_id))
+                .put_inode(&Inode::new_dir(inode_id, InodeAttrs::new(), mount_id))
                 .unwrap();
         }
         storage
-            .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), mount_id))
+            .put_inode(&Inode::new_file(
+                file_inode_id,
+                InodeAttrs::new(),
+                mount_id,
+                beryl_types::FileLayout::new(4096),
+            ))
             .unwrap();
         storage.put_dentry(parent_inode_id, "source", source_inode_id).unwrap();
         storage.put_dentry(parent_inode_id, "target", target_inode_id).unwrap();

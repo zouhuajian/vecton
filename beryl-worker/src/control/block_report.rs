@@ -32,7 +32,7 @@ use crate::control::{
 use crate::error::WorkerError;
 use crate::observe;
 use crate::report::DirtyBlock;
-use crate::store::block::{BlockMetaPayload, BlockState, LocalBlockStore};
+use crate::store::block::{BlockMetaPayload, BlockState};
 use crate::store::dirs::StoreDirs;
 use crate::WorkerCore;
 
@@ -419,15 +419,16 @@ impl MetadataBlockReportLoop {
         group_name: &GroupName,
         block_id: BlockId,
     ) -> Result<DeltaBlockReportEntryProto, BlockReportError> {
-        if let Some(reclaiming) = self.core.reclaiming_block(group_name, block_id) {
+        if self.core.reclaiming_block(group_name, block_id).is_some() {
             return Ok(present_entry(ReportedBlockProto {
                 block_id: Some(block_id.into()),
-                block_stamp: reclaiming.block_stamp,
+                lease_epoch: 0,
+                tier: 0,
                 state: ReportedBlockStateProto::ReportedBlockStateDeleting as i32,
                 effective_len: 0,
             }));
         }
-        match self.store.load_meta(group_name, block_id) {
+        match self.store.load_report_meta(group_name, block_id) {
             Ok(meta) => meta_to_report_block(meta).map(present_entry),
             Err(WorkerError::NotFound(_)) => Ok(DeltaBlockReportEntryProto {
                 block: Some(delta_block_report_entry_proto::Block::Absent(block_id.into())),
@@ -455,7 +456,8 @@ impl MetadataBlockReportLoop {
                 reclaiming.block_id,
                 ReportedBlockProto {
                     block_id: Some(reclaiming.block_id.into()),
-                    block_stamp: reclaiming.block_stamp,
+                    lease_epoch: 0,
+                    tier: 0,
                     state: ReportedBlockStateProto::ReportedBlockStateDeleting as i32,
                     effective_len: 0,
                 },
@@ -823,18 +825,15 @@ fn meta_to_report_block(meta: BlockMetaPayload) -> Result<ReportedBlockProto, Bl
     let block_state = match meta.visibility.block_state {
         BlockState::Ready => ReportedBlockStateProto::ReportedBlockStateReady,
         BlockState::Corrupt => ReportedBlockStateProto::ReportedBlockStateCorrupt,
-        BlockState::Loading => {
-            return Err(BlockReportError::Fatal(
-                "loading block metadata is not valid for block report".to_string(),
-            ));
-        }
+        BlockState::Deleting => ReportedBlockStateProto::ReportedBlockStateDeleting,
     };
     let block_id = meta.identity.block_id;
     Ok(ReportedBlockProto {
         block_id: Some(block_id.into()),
-        block_stamp: meta.visibility.block_stamp,
+        lease_epoch: meta.visibility.fencing_token.epoch.as_raw(),
+        tier: beryl_proto::common::TierProto::from(meta.tier) as i32,
         state: block_state as i32,
-        effective_len: meta.source.effective_len,
+        effective_len: meta.source.durable_len,
     })
 }
 

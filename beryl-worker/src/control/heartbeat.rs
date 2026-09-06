@@ -416,15 +416,7 @@ fn classify_heartbeat_response(
                     "HeartbeatResponse.cleanup_commands.block_id.inode_id must be non-zero".to_string(),
                 ));
             }
-            if command.expected_block_stamp == 0 {
-                return Err(HeartbeatError::Fatal(
-                    "HeartbeatResponse.cleanup_commands.expected_block_stamp must be non-zero".to_string(),
-                ));
-            }
-            Ok(BlockCleanupCommand {
-                block_id,
-                expected_block_stamp: command.expected_block_stamp,
-            })
+            Ok(BlockCleanupCommand { block_id })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let liveness_timeout = Duration::from_millis(u64::from(response.liveness_timeout_ms.max(1)));

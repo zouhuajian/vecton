@@ -11,8 +11,9 @@ mod worker;
 mod write;
 
 use crate::error::{MetadataError, MetadataResult};
-use crate::inode::{Inode, InodeData};
-use crate::raft::command::{Command, PublishMode};
+use crate::inode::InodeAttrs;
+use crate::inode::{Inode, InodeKind};
+use crate::raft::command::Command;
 use crate::raft::response::{
     ApplyRejection, ApplySuccess, DetachedRootReclaimResult, FatalApplyError, RaftApplyResult,
 };
@@ -23,10 +24,9 @@ use crate::raft::storage::{
 use crate::raft::types::AppMetadataRaftState;
 use crate::raft::RoutingDelta;
 use crate::session_registry::CreateFileOperationId;
-use beryl_types::fs::{Extent, FileAttrs};
 use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
-use beryl_types::{ContentGeneration, GroupName, MAX_FILE_EXTENTS};
+use beryl_types::GroupName;
 use std::sync::Arc;
 
 /// Raft state machine.
@@ -80,7 +80,6 @@ struct PreparedRename {
     overwritten_target: Option<PreparedRenameOverwrite>,
     updated_src_parent: Option<Inode>,
     updated_dst_parent: Option<Inode>,
-    updated_src_inode: Inode,
 }
 
 type PreparedUnlink = (InodeId, Inode);
@@ -261,31 +260,9 @@ impl AppRaftStateMachine {
             Command::PublishFile {
                 proposed_at_ms,
                 inode_id,
-                extents,
-                target_size,
-                expected_generation,
-                expected_file_size,
-                lease_epoch,
-                mode,
+                publication,
             } => {
-                if extents.len() > MAX_FILE_EXTENTS {
-                    return Err(MetadataError::ResourceExhausted(format!(
-                        "PublishFile extent count {} exceeds maximum {}",
-                        extents.len(),
-                        MAX_FILE_EXTENTS
-                    )));
-                }
-                let generation = self.apply_publish_file(
-                    inode_id,
-                    extents,
-                    target_size,
-                    expected_generation,
-                    expected_file_size,
-                    lease_epoch,
-                    mode,
-                    proposed_at_ms,
-                    raft_state,
-                )?;
+                let generation = self.apply_publish_file(inode_id, publication, proposed_at_ms, raft_state)?;
                 Ok(ApplySuccess::FilePublished { inode_id, generation })
             }
             Command::CommitFile {
@@ -335,137 +312,7 @@ impl AppRaftStateMachine {
     }
 
     fn mutation_timestamp(inode: &Inode, proposed_at_ms: u64) -> u64 {
-        proposed_at_ms.max(inode.attrs.mtime_ms).max(inode.attrs.ctime_ms)
-    }
-
-    fn extent_end(extent: &Extent) -> MetadataResult<u64> {
-        extent.file_offset.checked_add(extent.len).ok_or_else(|| {
-            MetadataError::InvalidArgument(format!(
-                "Extent end overflows: file_offset={}, len={}",
-                extent.file_offset, extent.len
-            ))
-        })
-    }
-
-    fn extent_matches_visible(existing: &[Extent], candidate: &Extent) -> bool {
-        Self::matching_visible_extent(existing, candidate).is_some()
-    }
-
-    fn matching_visible_extent<'a>(existing: &'a [Extent], candidate: &Extent) -> Option<&'a Extent> {
-        existing.iter().find(|visible| {
-            visible.block_id == candidate.block_id
-                && visible.file_offset == candidate.file_offset
-                && visible.block_offset == candidate.block_offset
-                && visible.len == candidate.len
-        })
-    }
-
-    fn visible_suffix_matches(existing: &[Extent], requested: &[Extent], start_offset: u64, target_size: u64) -> bool {
-        let mut visible = existing.iter().filter(|extent| extent.file_offset >= start_offset);
-        let mut expected_offset = start_offset;
-        for candidate in requested {
-            let Some(extent) = visible.next() else {
-                return false;
-            };
-            if extent.file_offset != expected_offset
-                || Self::matching_visible_extent(std::slice::from_ref(extent), candidate).is_none()
-            {
-                return false;
-            }
-            let Some(end) = extent.file_offset.checked_add(extent.len) else {
-                return false;
-            };
-            if end > target_size {
-                return false;
-            }
-            expected_offset = end;
-        }
-        expected_offset == target_size && visible.next().is_none()
-    }
-
-    /// Stamp every extent with its publication generation while retaining existing block stamps.
-    fn stamp_extents(extents: &mut [Extent], existing: &[Extent], generation: ContentGeneration) {
-        for extent in extents {
-            if let Some(visible) = Self::matching_visible_extent(existing, extent) {
-                if let Some(block_stamp) = visible.block_stamp {
-                    extent.generation = Some(generation);
-                    extent.block_stamp = Some(block_stamp);
-                    continue;
-                }
-            }
-            extent.generation = Some(generation);
-            // The Raft apply boundary assigns the metadata-authoritative stamp
-            // that direct readers must present to workers for newly visible
-            // blocks.
-            extent.block_stamp = Some(generation.as_raw());
-        }
-    }
-
-    fn validate_contiguous_extents(
-        extents: &[Extent],
-        start_offset: u64,
-        target_size: u64,
-        label: &str,
-    ) -> MetadataResult<()> {
-        let mut expected_offset = start_offset;
-        for extent in extents {
-            if extent.file_offset != expected_offset {
-                return Err(MetadataError::InvalidArgument(format!(
-                    "{} extent file_offset mismatch: expected {}, got {}",
-                    label, expected_offset, extent.file_offset
-                )));
-            }
-            expected_offset = Self::extent_end(extent)?;
-        }
-        if expected_offset != target_size {
-            return Err(MetadataError::InvalidArgument(format!(
-                "{} target_size mismatch: expected {}, got {}",
-                label, expected_offset, target_size
-            )));
-        }
-        Ok(())
-    }
-
-    /// Return the suffix that still needs publication for append-style commits.
-    fn append_extents_not_already_visible(
-        existing: &[Extent],
-        requested: &[Extent],
-        current_size: u64,
-        target_size: u64,
-        label: &str,
-    ) -> MetadataResult<Vec<Extent>> {
-        let mut expected_offset = current_size;
-        let mut publish = Vec::new();
-        for extent in requested {
-            if Self::extent_end(extent)? <= current_size && Self::extent_matches_visible(existing, extent) {
-                continue;
-            }
-            if extent.file_offset != expected_offset {
-                return Err(MetadataError::InvalidArgument(format!(
-                    "{} extent file_offset mismatch: expected {}, got {}",
-                    label, expected_offset, extent.file_offset
-                )));
-            }
-            expected_offset = Self::extent_end(extent)?;
-            publish.push(extent.clone());
-        }
-        if expected_offset != target_size {
-            return Err(MetadataError::InvalidArgument(format!(
-                "{} target_size mismatch: expected {}, got {}",
-                label, expected_offset, target_size
-            )));
-        }
-        Ok(publish)
-    }
-
-    /// Advance visible file authority, failing closed when the counter is exhausted.
-    fn next_generation(inode_id: InodeId, generation: Option<ContentGeneration>) -> MetadataResult<ContentGeneration> {
-        generation.unwrap_or_default().checked_next().ok_or_else(|| {
-            MetadataError::Internal(format!(
-                "generation overflow for inode {} at {:?}",
-                inode_id, generation
-            ))
-        })
+        proposed_at_ms.max(inode.attrs.modify_time)
     }
 }
 
@@ -473,12 +320,11 @@ impl AppRaftStateMachine {
 pub(crate) mod tests {
     pub(crate) use super::*;
     pub(crate) use crate::inode::Inode;
+    pub(crate) use crate::inode::InodeAttrs;
     use crate::mount::MountEntry;
     use crate::raft::response::ApplyRejectionKind;
-    pub(crate) use beryl_types::fs::FileAttrs;
     pub(crate) use beryl_types::ids::{BlockId, InodeId, MountId, WorkerId};
     pub(crate) use beryl_types::layout::FileLayout;
-    use beryl_types::LeaseEpoch;
     pub(crate) use tempfile::TempDir;
 
     impl AppRaftStateMachine {
@@ -515,7 +361,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn expect_directory_ensured(raw: ApplySuccess) -> (InodeId, FileAttrs) {
+    pub(crate) fn expect_directory_ensured(raw: ApplySuccess) -> (InodeId, InodeAttrs) {
         match raw {
             ApplySuccess::DirectoryEnsured { inode_id, attrs } => (inode_id, attrs),
             other => panic!("unexpected apply response: {other:?}"),
@@ -563,66 +409,6 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn expect_write_lease_ended(raw: ApplySuccess) -> (InodeId, u64) {
-        match raw {
-            ApplySuccess::WriteLeaseEnded { inode_id, lease_epoch } => (inode_id, lease_epoch.as_raw()),
-            other => panic!("unexpected apply response: {other:?}"),
-        }
-    }
-
-    pub(crate) fn expect_file_published(raw: ApplySuccess) -> (InodeId, u64) {
-        match raw {
-            ApplySuccess::FilePublished { inode_id, generation } => (inode_id, generation.as_raw()),
-            other => panic!("unexpected apply response: {other:?}"),
-        }
-    }
-
-    pub(crate) fn extent(block_id: BlockId, file_offset: u64, len: u64) -> Extent {
-        Extent {
-            file_offset,
-            block_id,
-            block_offset: 0,
-            len,
-            generation: None,
-            block_stamp: None,
-        }
-    }
-
-    pub(crate) fn install_file_with_extents(
-        storage: &RocksDBStorage,
-        parent_inode_id: InodeId,
-        name: &str,
-        inode_id: InodeId,
-        extents: Vec<Extent>,
-        size: u64,
-    ) -> Inode {
-        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
-        let mut inode = Inode::new_file(inode_id, FileAttrs::new(), parent.mount_id);
-        inode.attrs.size = size;
-        let next_block_index = extents
-            .iter()
-            .map(|extent| u64::from(extent.block_id.index.as_raw()) + 1)
-            .max()
-            .unwrap_or(0);
-        let InodeData::File {
-            extents: stored_extents,
-            lease_epoch,
-            next_block_index: stored_next_block_index,
-            ..
-        } = &mut inode.data
-        else {
-            unreachable!("new file must carry file data");
-        };
-        *stored_extents = extents;
-        *lease_epoch = Some(LeaseEpoch::new(1));
-        *stored_next_block_index = next_block_index;
-        storage.put_inode(&parent).unwrap();
-        storage.put_inode(&inode).unwrap();
-        storage.put_dentry(parent_inode_id, name, inode_id).unwrap();
-        storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
-        inode
-    }
-
     #[test]
     fn bootstrap_namespace_is_convergent_and_creates_one_root() {
         let dir = TempDir::new().unwrap();
@@ -645,7 +431,7 @@ pub(crate) mod tests {
         storage
             .put_inode(&Inode::new_dir(
                 crate::mount::ROOT_INODE_ID,
-                FileAttrs::new(),
+                InodeAttrs::new(),
                 MountId::new(1),
             ))
             .unwrap();
@@ -664,7 +450,7 @@ pub(crate) mod tests {
         let sm = AppRaftStateMachine::new(Arc::clone(&storage));
         expect_mount_upserted(sm.apply(bootstrap_command("root", 10)).unwrap());
         let mut root = storage.get_inode(crate::mount::ROOT_INODE_ID).unwrap().unwrap();
-        root.attrs.update_timestamps(5_000);
+        root.attrs.initialize(5_000);
         storage.put_inode(&root).unwrap();
 
         let response = sm
@@ -672,20 +458,20 @@ pub(crate) mod tests {
                 proposed_at_ms: 1_000,
                 root_inode_id: crate::mount::ROOT_INODE_ID,
                 components: vec!["child".to_string()],
-                attrs: FileAttrs::new(),
+                attrs: InodeAttrs::new(),
                 recursive: false,
             })
             .unwrap();
         let child_id = expect_directory_ensured(response).0;
 
-        assert_eq!(storage.get_inode(child_id).unwrap().unwrap().attrs.mtime_ms, 1_000);
+        assert_eq!(storage.get_inode(child_id).unwrap().unwrap().attrs.modify_time, 1_000);
         assert_eq!(
             storage
                 .get_inode(crate::mount::ROOT_INODE_ID)
                 .unwrap()
                 .unwrap()
                 .attrs
-                .mtime_ms,
+                .modify_time,
             5_000
         );
     }

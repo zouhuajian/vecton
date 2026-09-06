@@ -97,7 +97,7 @@ fn worker_start_refuses_partial_storage_info_temp_without_final_marker() {
 
 #[test]
 fn worker_start_rejects_non_current_storage_versions_without_rewriting_them() {
-    for unsupported_version in [0, 2, u32::MAX] {
+    for unsupported_version in [0, 1, 3, u32::MAX] {
         let dir = TempDir::new().unwrap();
         let config_path = write_config(&dir, "cluster-a", "root");
         let config = WorkerConfig::load(&config_path).unwrap();
@@ -124,7 +124,7 @@ fn worker_start_rejects_non_current_storage_versions_without_rewriting_them() {
             message.contains(&format!("format_version={unsupported_version}")),
             "{message}"
         );
-        assert!(message.contains("expected 1"), "{message}");
+        assert!(message.contains("expected 2"), "{message}");
         assert_eq!(std::fs::read(&info_path).unwrap(), unsupported_info.as_bytes());
     }
 }

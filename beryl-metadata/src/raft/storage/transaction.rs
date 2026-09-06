@@ -3,10 +3,10 @@
 
 use super::{
     decode_from_slice, encode_to_vec, standard, worker_key, AppMetadataRaftState, AuthorityBatch, ColumnFamily,
-    CreateFileReplayRecord, DetachedRoot, DetachedRootReclaimUpdate, FileLayout, Inode, InodeAllocation, InodeId,
-    Instant, MetadataError, MetadataResult, MountEntry, RecursiveMkdirEntry, RenameAtomicUpdate, RocksDBStorage,
-    RouteEpoch, WorkerInfo, WriteBatch, CF_DENTRIES, CF_DETACHED_ROOTS, CF_INODES, CF_META, CF_MOUNTS, CF_RAFT_STATE,
-    CF_WORKERS, CREATE_FILE_REPLAY_COUNT_KEY, CREATE_FILE_REPLAY_EXPIRY_PREFIX, DB, MAX_CREATE_FILE_REPLAY_RECORDS,
+    CreateFileReplayRecord, DetachedRoot, DetachedRootReclaimUpdate, Inode, InodeAllocation, InodeId, Instant,
+    MetadataError, MetadataResult, MountEntry, RecursiveMkdirEntry, RenameAtomicUpdate, RocksDBStorage, RouteEpoch,
+    WorkerInfo, WriteBatch, CF_DENTRIES, CF_DETACHED_ROOTS, CF_INODES, CF_META, CF_MOUNTS, CF_RAFT_STATE, CF_WORKERS,
+    CREATE_FILE_REPLAY_COUNT_KEY, CREATE_FILE_REPLAY_EXPIRY_PREFIX, DB, MAX_CREATE_FILE_REPLAY_RECORDS,
     NEXT_INODE_ID_KEY, RAFT_STATE_KEY,
 };
 use rocksdb::{Direction, IteratorMode};
@@ -32,19 +32,6 @@ impl RocksDBStorage {
             started.elapsed().as_secs_f64(),
         );
         result
-    }
-
-    fn batch_put_layout(
-        batch: &mut WriteBatch,
-        cf: &ColumnFamily,
-        inode_id: InodeId,
-        layout: FileLayout,
-    ) -> MetadataResult<()> {
-        let key = format!("layout:{}", inode_id.as_raw());
-        let value = encode_to_vec(layout, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize file layout: {}", e)))?;
-        batch.put_cf(cf, key.as_bytes(), value);
-        Ok(())
     }
 
     fn batch_put_mount(batch: &mut WriteBatch, cf: &ColumnFamily, entry: &MountEntry) -> MetadataResult<()> {
@@ -176,25 +163,6 @@ impl RocksDBStorage {
         self.commit_authority_batch(batch.into(), raft_state)
     }
 
-    /// Atomically persist visible file authority and the applied Raft state.
-    pub fn publish_file_atomic(
-        &self,
-        inode: &Inode,
-        layout: FileLayout,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf_inodes = Self::cf(db, CF_INODES)?;
-        let cf_meta = Self::cf(db, CF_META)?;
-        let mut batch = WriteBatch::default();
-
-        Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
-        Self::batch_put_layout(&mut batch, cf_meta, inode.inode_id, layout)?;
-
-        self.commit_authority_batch(batch.into(), raft_state)
-    }
-
     pub(crate) fn bootstrap_namespace_atomic(
         &self,
         root_inode: &Inode,
@@ -226,13 +194,11 @@ impl RocksDBStorage {
         name: &str,
         inode: &Inode,
         updated_parent: &Inode,
-        layout: FileLayout,
     ) -> MetadataResult<WriteBatch> {
         let generation = self.pin_generation()?;
         let db = generation.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_dentries = Self::cf(db, CF_DENTRIES)?;
-        let cf_meta = Self::cf(db, CF_META)?;
 
         let mut batch = WriteBatch::default();
         Self::batch_put_inode(&mut batch, cf_inodes, inode)?;
@@ -242,11 +208,6 @@ impl RocksDBStorage {
             Self::encode_dentry_key(parent_inode_id, name),
             inode.inode_id.to_be_bytes(),
         );
-
-        let layout_key = format!("layout:{}", inode.inode_id.as_raw());
-        let layout_value = encode_to_vec(layout, standard())
-            .map_err(|e| MetadataError::Internal(format!("Failed to serialize file layout: {}", e)))?;
-        batch.put_cf(cf_meta, layout_key.as_bytes(), layout_value);
 
         Ok(batch)
     }
@@ -387,7 +348,6 @@ impl RocksDBStorage {
         name: &str,
         inode: &Inode,
         updated_parent: &Inode,
-        layout: FileLayout,
         replay_record: &CreateFileReplayRecord,
         proposed_at_ms: u64,
         raft_state: &AppMetadataRaftState,
@@ -395,7 +355,7 @@ impl RocksDBStorage {
         let generation = self.pin_generation()?;
         let db = generation.db();
         Self::validate_inode_allocation_targets(db, allocation, std::slice::from_ref(&inode.inode_id))?;
-        let mut batch = self.create_file_batch(parent_inode_id, name, inode, updated_parent, layout)?;
+        let mut batch = self.create_file_batch(parent_inode_id, name, inode, updated_parent)?;
         let cf_meta = Self::cf(db, CF_META)?;
         Self::batch_put_inode_allocation(&mut batch, cf_meta, allocation)?;
         Self::batch_put_create_file_replay(db, cf_meta, &mut batch, replay_record, proposed_at_ms)?;
@@ -495,7 +455,7 @@ impl RocksDBStorage {
 
     /// Atomically persist empty-directory deletion with apply tracking.
     #[allow(clippy::too_many_arguments)]
-    pub fn delete_empty_dir_atomic(
+    pub fn unlink_inode_atomic(
         &self,
         parent_inode_id: InodeId,
         name: &str,
@@ -505,26 +465,6 @@ impl RocksDBStorage {
     ) -> MetadataResult<()> {
         let _generation = self.pin_generation()?;
         let batch = self.delete_dentry_inode_batch(parent_inode_id, name, inode_id, updated_parent)?;
-        self.commit_authority_batch(batch.into(), raft_state)
-    }
-
-    /// Atomically persist non-directory deletion with its file layout cleanup.
-    // Atomic storage helpers keep every column-family mutation visible at the call boundary.
-    #[allow(clippy::too_many_arguments)]
-    pub fn delete_file_atomic(
-        &self,
-        parent_inode_id: InodeId,
-        name: &str,
-        inode_id: InodeId,
-        updated_parent: &Inode,
-        raft_state: &AppMetadataRaftState,
-    ) -> MetadataResult<()> {
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf_meta = Self::cf(db, CF_META)?;
-        let mut batch = self.delete_dentry_inode_batch(parent_inode_id, name, inode_id, updated_parent)?;
-        let layout_key = format!("layout:{}", inode_id.as_raw());
-        batch.delete_cf(cf_meta, layout_key.as_bytes());
         self.commit_authority_batch(batch.into(), raft_state)
     }
 
@@ -572,7 +512,6 @@ impl RocksDBStorage {
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_dentries = Self::cf(db, CF_DENTRIES)?;
         let cf_detached_roots = Self::cf(db, CF_DETACHED_ROOTS)?;
-        let cf_meta = Self::cf(db, CF_META)?;
         let mut batch = WriteBatch::default();
 
         for entry in update.entries {
@@ -587,9 +526,6 @@ impl RocksDBStorage {
             }
 
             batch.delete_cf(cf_inodes, Self::encode_inode_key(entry.inode_id));
-            if entry.remove_file_layout {
-                batch.delete_cf(cf_meta, Self::encode_layout_key(entry.inode_id));
-            }
         }
         for root_inode_id in update.completed_root_inode_ids {
             batch.delete_cf(cf_inodes, Self::encode_inode_key(root_inode_id));
@@ -604,7 +540,6 @@ impl RocksDBStorage {
         let db = generation.db();
         let cf_inodes = Self::cf(db, CF_INODES)?;
         let cf_dentries = Self::cf(db, CF_DENTRIES)?;
-        let cf_meta = Self::cf(db, CF_META)?;
 
         let mut batch = WriteBatch::default();
 
@@ -614,8 +549,6 @@ impl RocksDBStorage {
                 cf_dentries,
                 Self::encode_dentry_key(update.dst_parent_inode_id, update.dst_name),
             );
-            let layout_key = format!("layout:{}", cleanup.inode_id.as_raw());
-            batch.delete_cf(cf_meta, layout_key.as_bytes());
         }
 
         batch.delete_cf(
@@ -634,7 +567,6 @@ impl RocksDBStorage {
         if let Some(parent) = update.updated_dst_parent {
             Self::batch_put_inode(&mut batch, cf_inodes, parent)?;
         }
-        Self::batch_put_inode(&mut batch, cf_inodes, update.updated_src_inode)?;
 
         Ok(batch)
     }
@@ -654,8 +586,10 @@ impl RocksDBStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inode::InodeAttrs;
     use crate::session_registry::CreateFileOperationId;
-    use beryl_types::fs::FileAttrs;
+    use beryl_types::FileLayout;
+
     use beryl_types::{CallId, ClientId, ContentGeneration, LeaseEpoch, MountId};
     use openraft::{LeaderId, LogId};
     use tempfile::TempDir;
@@ -677,20 +611,13 @@ mod tests {
             Ok(())
         }
 
-        /// Persist the layout for a specific inode (authoritative data-plane parameters).
+        /// Set fixture layout through the same inode value used by production.
         pub fn put_layout(&self, inode_id: InodeId, layout: FileLayout) -> MetadataResult<()> {
-            let generation = self.pin_generation()?;
-            let db = generation.db();
-            let cf = db
-                .cf_handle(CF_META)
-                .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-            let key = format!("layout:{}", inode_id.as_raw());
-            let value = encode_to_vec(layout, standard())
-                .map_err(|e| MetadataError::Internal(format!("Failed to serialize file layout: {}", e)))?;
-
-            db.put_cf(cf, key.as_bytes(), value)
-                .map_err(|e| MetadataError::Internal(format!("RocksDB error: {}", e)))?;
-            Ok(())
+            let mut inode = self
+                .get_inode(inode_id)?
+                .ok_or_else(|| MetadataError::NotFound("inode missing".into()))?;
+            inode.file_mut()?.layout = layout;
+            self.put_inode(&inode)
         }
 
         /// Put mount entry.
@@ -762,7 +689,7 @@ mod tests {
                 let raw = first_inode_id
                     .checked_add(offset as u64)
                     .ok_or_else(|| MetadataError::Internal("test inode range overflow".to_string()))?;
-                let inode = Inode::new_dir(InodeId::new(raw), FileAttrs::new(), detached_root.mount_id);
+                let inode = Inode::new_dir(InodeId::new(raw), InodeAttrs::new(), detached_root.mount_id);
                 Self::batch_put_inode(&mut batch, cf_inodes, &inode)?;
                 batch.put_cf(
                     cf_detached_roots,
@@ -907,7 +834,7 @@ mod tests {
         let unexpired_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(unexpired_dir.path()).unwrap();
         let parent_inode_id = InodeId::new(10);
-        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let parent = Inode::new_dir(parent_inode_id, InodeAttrs::new(), MountId::new(1));
         storage.put_inode(&parent).unwrap();
         storage.set_next_inode_id(InodeId::new(11)).unwrap();
         let retained = replay_record(1, 50, 101);
@@ -919,9 +846,13 @@ mod tests {
                 allocation,
                 parent_inode_id,
                 &rejected.name,
-                &Inode::new_file(allocation.inode_id, FileAttrs::new(), MountId::new(1)),
+                &Inode::new_file(
+                    allocation.inode_id,
+                    InodeAttrs::new(),
+                    MountId::new(1),
+                    beryl_types::FileLayout::new(4096),
+                ),
                 &parent,
-                rejected.layout,
                 &rejected,
                 100,
                 &AppMetadataRaftState::default(),
@@ -939,7 +870,7 @@ mod tests {
 
         let expired_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(expired_dir.path()).unwrap();
-        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let parent = Inode::new_dir(parent_inode_id, InodeAttrs::new(), MountId::new(1));
         storage.put_inode(&parent).unwrap();
         storage.set_next_inode_id(InodeId::new(11)).unwrap();
         let expired = replay_record(3, 51, 100);
@@ -951,9 +882,13 @@ mod tests {
                 allocation,
                 parent_inode_id,
                 &replacement.name,
-                &Inode::new_file(allocation.inode_id, FileAttrs::new(), MountId::new(1)),
+                &Inode::new_file(
+                    allocation.inode_id,
+                    InodeAttrs::new(),
+                    MountId::new(1),
+                    beryl_types::FileLayout::new(4096),
+                ),
                 &parent,
-                replacement.layout,
                 &replacement,
                 100,
                 &AppMetadataRaftState::default(),
@@ -992,11 +927,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(temp_dir.path()).unwrap();
         let parent_inode_id = InodeId::new(10);
-        let parent = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let parent = Inode::new_dir(parent_inode_id, InodeAttrs::new(), MountId::new(1));
         storage.put_inode(&parent).unwrap();
         storage.set_next_inode_id(InodeId::new(11)).unwrap();
         let allocation = storage.prepare_inode_allocation().unwrap();
-        let existing = Inode::new_file(allocation.inode_id, FileAttrs::new(), MountId::new(1));
+        let existing = Inode::new_file(
+            allocation.inode_id,
+            InodeAttrs::new(),
+            MountId::new(1),
+            beryl_types::FileLayout::new(4096),
+        );
         storage.put_inode(&existing).unwrap();
         let applied_before = storage.load_raft_state().unwrap();
         let rejected_applied_state = AppMetadataRaftState {
@@ -1010,9 +950,13 @@ mod tests {
                 allocation,
                 parent_inode_id,
                 &replay_record.name,
-                &Inode::new_file(allocation.inode_id, FileAttrs::new(), MountId::new(1)),
+                &Inode::new_file(
+                    allocation.inode_id,
+                    InodeAttrs::new(),
+                    MountId::new(1),
+                    beryl_types::FileLayout::new(4096),
+                ),
                 &parent,
-                FileLayout::new(4096),
                 &replay_record,
                 1,
                 &rejected_applied_state,
@@ -1023,7 +967,6 @@ mod tests {
         assert_eq!(storage.load_raft_state().unwrap(), applied_before);
         assert_eq!(storage.get_inode(allocation.inode_id).unwrap(), Some(existing));
         assert_eq!(storage.get_dentry(parent_inode_id, &replay_record.name).unwrap(), None);
-        assert_eq!(storage.get_layout_optional(allocation.inode_id).unwrap(), None);
         assert_eq!(storage.get_next_inode_id().unwrap(), Some(allocation.inode_id));
     }
 }

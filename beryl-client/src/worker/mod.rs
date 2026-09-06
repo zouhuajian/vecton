@@ -39,7 +39,7 @@ pub(crate) trait WorkerTransport: Send + Sync {
     ) -> ClientResult<()>;
 
     /// Opens one metadata-authorized block write and returns only after the
-    /// Worker acknowledges staging ownership.
+    /// Worker acknowledges write ownership.
     async fn open_write_block(
         &self,
         attempt: AttemptContext,
@@ -182,8 +182,8 @@ impl BlockWrite {
     ) -> Self {
         Self {
             operation,
+            written_len: target.write_offset,
             target,
-            written_len: 0,
             requests: Some(requests),
             cancellation: Some(cancellation),
             lease,

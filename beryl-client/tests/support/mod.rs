@@ -198,6 +198,15 @@ fn metadata_response<T: Default>(
 
 #[tonic::async_trait]
 impl FileSystemServiceProto for MockMetadata {
+    async fn authorize_block_write(
+        &self,
+        _request: Request<beryl_proto::metadata::AuthorizeBlockWriteRequestProto>,
+    ) -> Result<Response<beryl_proto::metadata::AuthorizeBlockWriteResponseProto>, Status> {
+        Err(Status::unimplemented(
+            "client fixture does not serve Worker authorization",
+        ))
+    }
+
     async fn get_status(
         &self,
         request: Request<GetStatusRequestProto>,

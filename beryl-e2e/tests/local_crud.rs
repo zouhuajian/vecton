@@ -29,7 +29,7 @@ async fn local_client_crud_roundtrip() {
     let status = client.get_status(path).await.expect("status after close");
     assert_eq!(status.path(), path);
     assert_eq!(status.kind, FileType::File);
-    assert_eq!(status.attrs.size, first.len() as u64);
+    assert_eq!(status.len, first.len() as u64);
 
     let read = client
         .open(path)
@@ -77,11 +77,14 @@ async fn local_client_crud_roundtrip() {
         [path, subdir]
     );
     assert_eq!(listed[0].kind, FileType::File);
-    assert_eq!(listed[0].attrs.size, expected.len() as u64);
+    assert_eq!(listed[0].len, expected.len() as u64);
     assert_eq!(listed[1].kind, FileType::Dir);
 
     client.delete(subdir).await.expect("delete empty listing subdirectory");
 
+    let before_rename = client.get_status(path).await.unwrap();
+    assert_eq!(before_rename.create_time, status.create_time);
+    assert!(before_rename.modify_time >= status.modify_time);
     let reader_opened_before_rename = client.open(path).await.expect("open reader before rename");
     client
         .rename(path, renamed_path)
@@ -91,7 +94,9 @@ async fn local_client_crud_roundtrip() {
 
     let renamed_status = client.get_status(renamed_path).await.expect("status after rename");
     assert_eq!(renamed_status.path(), renamed_path);
-    assert_eq!(renamed_status.attrs.size, expected.len() as u64);
+    assert_eq!(renamed_status.create_time, before_rename.create_time);
+    assert_eq!(renamed_status.modify_time, before_rename.modify_time);
+    assert_eq!(renamed_status.len, expected.len() as u64);
 
     let renamed_read = client
         .open(renamed_path)
@@ -189,6 +194,7 @@ async fn visibility_sync_then_continue_write_roundtrip() {
     let expected = [first.as_ref(), second.as_ref()].concat();
     assert_eq!(actual.as_ref(), expected.as_slice());
 
+    assert_eq!(cluster.physical_block_count().unwrap(), 2);
     cluster.shutdown().await.expect("local cluster shutdown");
 }
 

@@ -31,7 +31,7 @@ pub(crate) fn proto_to_read_block_request(proto: ReadBlockRequestProto) -> Worke
             offset: byte_range.offset,
             len: byte_range.len,
         },
-        block_stamp: proto.block_stamp,
+
         block_format_id,
         block_size: proto.block_size,
         chunk_size: proto.chunk_size,
@@ -58,7 +58,9 @@ pub(crate) fn proto_to_write_block_request(proto: WriteBlockCommandProto) -> Wor
         group_name,
         block_id,
         worker_run_id,
-        block_stamp: proto.block_stamp,
+        fencing_token: proto_convert::required_fencing_token(proto.fencing_token, "fencing_token")
+            .map_err(WorkerError::InvalidArgument)?,
+        write_offset: proto.write_offset,
         block_size: proto.block_size,
         block_format_id,
         chunk_size: proto.chunk_size,

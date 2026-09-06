@@ -148,8 +148,9 @@ mod tests {
 
     fn report_block(block_id: BlockId) -> BlockReportBlock {
         BlockReportBlock {
+            tier: Some(beryl_types::Tier::Hdd),
             block_id,
-            block_stamp: u64::from(block_id.index.as_raw()) + 1,
+            lease_epoch: u64::from(block_id.index.as_raw()) + 1,
             block_state: BlockReportBlockState::Ready,
             effective_len: 64,
         }

@@ -34,7 +34,7 @@ mod worker;
 
 // Re-export commonly used types
 pub use api::{DeleteOptions, ListStatusOptions, MkdirOptions};
-pub use api::{FileAttrs, FileStatus, FileType, ListStatusIterator};
 pub use api::{FileReader, FileWriter, FsClient};
+pub use api::{FileStatus, FileType, ListStatusIterator};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{ClientError, ClientErrorKind, ClientResult};

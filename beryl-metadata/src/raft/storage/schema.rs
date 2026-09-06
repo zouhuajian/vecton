@@ -358,7 +358,8 @@ fn missing_rocksdb_state_error(path: &Path, detail: &str) -> MetadataError {
 mod tests {
     use super::*;
     use crate::inode::Inode;
-    use beryl_types::FileAttrs;
+    use crate::inode::InodeAttrs;
+
     use beryl_types::MountId;
     use tempfile::TempDir;
 
@@ -435,7 +436,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::create_for_format(dir.path()).unwrap();
         storage
-            .put_inode(&Inode::new_dir(InodeId::new(1), FileAttrs::new(), MountId::new(1)))
+            .put_inode(&Inode::new_dir(InodeId::new(1), InodeAttrs::new(), MountId::new(1)))
             .unwrap();
         storage
             .with_pinned_db(|db| {

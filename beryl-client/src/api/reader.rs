@@ -424,7 +424,6 @@ fn should_replan_after_worker_error(error: &ClientError) -> bool {
             ErrorKind::Metadata(MetadataErrorKind::StaleState | MetadataErrorKind::RouteEpochMismatch)
                 | ErrorKind::Worker(
                     WorkerErrorKind::BlockLocationUnavailable
-                        | WorkerErrorKind::BlockStampMismatch
                         | WorkerErrorKind::RunMismatch
                         | WorkerErrorKind::FullReportRequired
                         | WorkerErrorKind::NotRegistered

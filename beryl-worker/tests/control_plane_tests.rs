@@ -28,8 +28,8 @@ use beryl_worker::control::{
 use beryl_worker::net::protocol::WorkerNetProtocol;
 use beryl_worker::net::server::grpc::WorkerDataServiceImpl;
 use beryl_worker::store::block::{
-    ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
-    PublishReadyRequest, ReclaimBlockRequest,
+    CheckpointBlockRequest, ChecksumKind, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
+    OpenBlockWriteRequest, ReclaimBlockRequest,
 };
 use beryl_worker::store::dirs::StoreDirs;
 use beryl_worker::{ReclaimBlockResult, WorkerCore};
@@ -53,7 +53,7 @@ use tonic::{Request, Response, Status};
 const BLOCK_SIZE: u64 = 4096;
 
 fn chunk_size() -> u32 {
-    BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size
+    BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size
 }
 
 fn block_id() -> BlockId {
@@ -437,14 +437,22 @@ fn publish_ready_block_for(
     group_name: GroupName,
     block_id: BlockId,
     data: Bytes,
-    block_stamp: u64,
+    lease_epoch: u64,
 ) {
+    let token = beryl_types::FencingToken::new(
+        block_id,
+        beryl_types::ClientId::new(9),
+        beryl_types::LeaseEpoch::new(lease_epoch),
+    );
     store
-        .create_staging_block(CreateStagingBlockRequest {
+        .open_block_write(OpenBlockWriteRequest {
+            fencing_token: token,
+            write_offset: 0,
+            visible_len: 0,
             group_name: group_name.clone(),
             block_id,
             block_size: BLOCK_SIZE,
-            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_format_id: BlockFormatId::DURABLE_PREFIX,
             chunk_size: chunk_size(),
             checksum_kind: ChecksumKind::None,
             tier: Tier::Hdd,
@@ -454,11 +462,11 @@ fn publish_ready_block_for(
         .write_at(&group_name, block_id, 0, data.clone())
         .expect("write block");
     store
-        .publish_ready(PublishReadyRequest {
+        .checkpoint_block(CheckpointBlockRequest {
             group_name,
             block_id,
             effective_len: data.len() as u64,
-            block_stamp,
+            fencing_token: token,
         })
         .expect("publish ready block");
 }
@@ -756,11 +764,9 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
         cleanup_commands: vec![
             BlockCleanupCommandProto {
                 block_id: Some(block_id().into()),
-                expected_block_stamp: 101,
             },
             BlockCleanupCommandProto {
                 block_id: Some(block_id().into()),
-                expected_block_stamp: 101,
             },
         ],
     }]);
@@ -805,7 +811,14 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
     )
     .expect("block reporter");
 
-    let service = WorkerDataServiceImpl::new(Arc::clone(&core), Arc::clone(&state), 64, 32);
+    let service = WorkerDataServiceImpl::new(
+        Arc::clone(&core),
+        Arc::clone(&state),
+        64,
+        32,
+        &test_registration_config("http://127.0.0.1:1".into()),
+    )
+    .unwrap();
     let read = service
         .read_block(Request::new(ReadBlockRequestProto {
             header: None,
@@ -813,8 +826,8 @@ async fn heartbeat_cleanup_command_reports_deleting_then_delta_absent() {
             block_id: Some(block_id().into()),
             worker_run_id: worker_run_id.to_string(),
             byte_range: Some(ByteRange { offset: 0, len: 1 }.into()),
-            block_stamp: 101,
-            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
+
+            block_format_id: BlockFormatId::DURABLE_PREFIX.as_raw(),
             block_size: BLOCK_SIZE,
             chunk_size: chunk_size(),
             effective_len: BLOCK_SIZE,
@@ -965,7 +978,6 @@ async fn block_report_loop_sends_coalesced_present_and_absent_entries_on_store_c
         core.reclaim_block(ReclaimBlockRequest {
             group_name: group_name(),
             block_id: first,
-            expected_block_stamp: 101,
         })
         .await
         .expect("reclaim Ready block"),
@@ -1036,7 +1048,6 @@ async fn result_unknown_retries_immutable_batches_and_preserves_newer_changes() 
         store.reclaim_block(&ReclaimBlockRequest {
             group_name: group_name(),
             block_id: fourth,
-            expected_block_stamp: 104,
         }),
         Ok(ReclaimBlockResult::Deleted { .. })
     ));
@@ -1125,13 +1136,13 @@ async fn block_report_rejects_responses_that_do_not_confirm_the_request() {
     state.record_heartbeat_success(&group_name(), Duration::from_secs(60));
     let temp = TempDir::new().expect("tempdir");
     let store = report_store(&temp);
-    for (block_index, block_stamp) in [(0, 101), (1, 102)] {
+    for (block_index, lease_epoch) in [(0, 101), (1, 102)] {
         publish_ready_block_for(
             store.as_ref(),
             group_name(),
             BlockId::new(InodeId::new(7), BlockIndex::new(block_index)),
             payload(),
-            block_stamp,
+            lease_epoch,
         );
     }
     let reporter = MetadataBlockReportLoop::with_options(
@@ -1181,7 +1192,7 @@ async fn block_report_rejects_responses_that_do_not_confirm_the_request() {
 }
 
 #[tokio::test]
-async fn startup_marker_recovery_precedes_first_full_block_report() {
+async fn startup_deleting_recovery_precedes_first_full_block_report() {
     let worker_run_id = test_worker_run_id();
     let (endpoint, mock, shutdown) = start_mock_metadata_with_block_reports(Vec::new()).await;
     let state = Arc::new(RegistrationSet::new());
@@ -1195,29 +1206,25 @@ async fn startup_marker_recovery_precedes_first_full_block_report() {
 
     let temp = TempDir::new().expect("tempdir");
     let data_root = temp.path().join("hdd0");
+    std::fs::create_dir_all(&data_root).unwrap();
     let raw_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(data_root));
     publish_ready_block_for(&raw_store, group_name(), block_id(), payload(), 101);
     let paths = raw_store.paths(&group_name(), block_id());
-    std::fs::create_dir_all(paths.deleting_marker_path.parent().expect("marker parent")).expect("create marker parent");
-    std::fs::write(
-        &paths.deleting_marker_path,
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "group_name": group_name().as_str(),
-            "block_id": block_id(),
-            "block_stamp": 101,
-            "effective_len": BLOCK_SIZE,
-        }))
-        .expect("encode deleting marker"),
-    )
-    .expect("write deleting marker");
+    // Recreate the durable Deleting checkpoint before either unlink is completed.
+    let mut bytes = std::fs::read(&paths.meta_path).unwrap();
+    let mut meta = <beryl_proto::worker::BlockMetaPayloadProto as prost::Message>::decode(&bytes[20..]).unwrap();
+    meta.visibility.as_mut().unwrap().block_state = beryl_proto::worker::BlockStateProto::BlockStateDeleting as i32;
+    let payload = prost::Message::encode_to_vec(&meta);
+    bytes.truncate(20);
+    bytes[12..20].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&payload);
+    std::fs::write(&paths.meta_path, bytes).unwrap();
     drop(raw_store);
 
     let store = report_store(&temp);
     assert_eq!(store.report().expect("store report").dirs[0].block_count, 0);
     assert!(!paths.data_path.exists());
     assert!(!paths.meta_path.exists());
-    assert!(!paths.deleting_marker_path.exists());
 
     let reporter = MetadataBlockReportLoop::new(
         test_registration_config(endpoint),

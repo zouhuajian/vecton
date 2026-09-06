@@ -184,7 +184,7 @@ async fn assert_stale_worker_run_rejected(
                 offset: 0,
                 len: location.len as u32,
             }),
-            block_stamp: location.block_stamp.expect("block stamp"),
+
             frame_size: 1024,
             worker_run_id: stale_run_id.to_string(),
             block_format_id: location.block_format_id,

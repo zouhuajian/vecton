@@ -19,6 +19,7 @@ pub fn spawn_worker_data_with_registration(
     config: &WorkerNetConfig,
     core: Arc<WorkerCore>,
     registration_state: Arc<RegistrationSet>,
+    metadata: &crate::config::WorkerRegistrationConfig,
 ) -> anyhow::Result<GrpcServerHandle> {
     let listener = grpc_listener(config)?;
     let routes = grpc::worker_data_routes(
@@ -26,7 +27,8 @@ pub fn spawn_worker_data_with_registration(
         registration_state,
         listener.max_concurrent_reads,
         listener.max_concurrent_writes,
-    );
+        metadata,
+    )?;
     let bind = listener
         .bind
         .parse()

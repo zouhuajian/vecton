@@ -237,8 +237,7 @@ impl MetadataTargets {
                     );
                 }
             }
-            ErrorKind::Metadata(MetadataErrorKind::StaleState)
-            | ErrorKind::Worker(WorkerErrorKind::RunMismatch | WorkerErrorKind::BlockStampMismatch) => {}
+            ErrorKind::Metadata(MetadataErrorKind::StaleState) | ErrorKind::Worker(WorkerErrorKind::RunMismatch) => {}
             _ => {
                 return Err(ClientError::metadata(format!(
                     "unsupported metadata refresh error kind: {kind:?}"

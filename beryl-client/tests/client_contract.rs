@@ -14,7 +14,7 @@ use beryl_proto::common::{
 };
 use beryl_proto::metadata::{
     AbortFileWriteResponseProto, AllocateBlockResponseProto, CommitFileResponseProto, CreateDirectoryResponseProto,
-    CreateFileResponseProto, FileAttrsProto, FileBlockLocationProto, FileTypeProto, GetBlockLocationsResponseProto,
+    CreateFileResponseProto, FileBlockLocationProto, FileTypeProto, GetBlockLocationsResponseProto,
     GetStatusResponseProto, LocatedBlockProto, MsyncResponseProto, OpenFileResponseProto, RenewLeaseResponseProto,
     SyncWriteResponseProto, WriteHandleProto,
 };
@@ -64,7 +64,7 @@ async fn metadata_read_retries_reuse_one_identity_and_deadline() {
     let client = FsClient::new(client_config(server.endpoint(), 3)).expect("client");
 
     let status = client.get_status("/alpha").await.expect("third attempt succeeds");
-    assert_eq!(status.attrs.size, 10);
+    assert_eq!(status.len, 10);
 
     let calls = metadata.calls();
     assert_methods(&calls, &["GetStatus", "GetStatus", "GetStatus"]);
@@ -82,7 +82,8 @@ async fn metadata_mutations_retry_only_when_the_public_operation_is_replayable()
         create_directory: VecDeque::from([
             MetadataReply::status(Status::unavailable("recursive CreateDirectory transport ambiguity")),
             MetadataReply::success(CreateDirectoryResponseProto {
-                attrs: Some(file_attrs(0)),
+                create_time: 11,
+                modify_time: 12,
                 ..CreateDirectoryResponseProto::default()
             }),
             MetadataReply::status(Status::unavailable("non-recursive CreateDirectory transport ambiguity")),
@@ -568,22 +569,11 @@ fn client_config(metadata_endpoint: &str, max_attempts: usize) -> ClientConfig {
 
 fn status_response(size: u64) -> GetStatusResponseProto {
     GetStatusResponseProto {
-        attrs: Some(file_attrs(size)),
+        len: size,
+        create_time: 11,
+        modify_time: 12,
         kind: FileTypeProto::FileTypeFile as i32,
         ..GetStatusResponseProto::default()
-    }
-}
-
-fn file_attrs(size: u64) -> FileAttrsProto {
-    FileAttrsProto {
-        mode: 0o100644,
-        uid: 1000,
-        gid: 1000,
-        size,
-        atime_ms: 11,
-        mtime_ms: 12,
-        ctime_ms: 13,
-        nlink: 1,
     }
 }
 
@@ -633,7 +623,7 @@ fn block_location(
         file_offset,
         len,
         workers: vec![worker(worker_endpoint)],
-        block_stamp: Some(u64::from(block_index) + 1),
+
         block_format_id: format.as_raw(),
         block_size: 64 * 1024 * 1024,
         chunk_size: format.spec().expect("block format").storage_chunk_size,
@@ -651,12 +641,13 @@ fn write_target(
     let block_id = BlockIdProto { inode_id, block_index };
     let format = BlockFormatId::CURRENT_FOR_NEW_FILE;
     LocatedBlockProto {
+        write_offset: 0,
         block_id: Some(block_id),
         file_offset,
         block_format_id: format.as_raw(),
         block_size,
         chunk_size: format.spec().expect("block format").storage_chunk_size,
-        block_stamp: u64::from(block_index) + 1,
+
         worker_endpoints: vec![worker(worker_endpoint)],
         fencing_token: Some(FencingTokenProto {
             block_id: Some(block_id),

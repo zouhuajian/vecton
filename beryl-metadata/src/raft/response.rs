@@ -4,8 +4,9 @@
 //! Responses produced by committed metadata Raft commands.
 
 use crate::error::MetadataError;
+use crate::inode::InodeAttrs;
 use crate::mount::MountEntry;
-use beryl_types::fs::FileAttrs;
+
 use beryl_types::ids::{BlockId, InodeId, WorkerId};
 use beryl_types::layout::FileLayout;
 use beryl_types::{ContentGeneration, LeaseEpoch};
@@ -31,7 +32,7 @@ pub(crate) enum ApplySuccess {
     /// Root mount created or confirmed by namespace bootstrap.
     MountUpserted(MountEntry),
     /// Requested directory path exists with these persisted attributes.
-    DirectoryEnsured { inode_id: InodeId, attrs: FileAttrs },
+    DirectoryEnsured { inode_id: InodeId, attrs: InodeAttrs },
     /// File inode, initial write lease, and replay record committed atomically.
     FileCreated {
         inode_id: InodeId,

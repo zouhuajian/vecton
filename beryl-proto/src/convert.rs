@@ -17,8 +17,7 @@ use crate::common::{
     WorkerEndpointInfoProto, WorkerErrorKindProto,
 };
 use crate::metadata::{
-    CommittedBlockProto, FileAttrsProto, FileBlockLocationProto, FileTypeProto, LocatedBlockProto, OpenWriteModeProto,
-    WriteHandleProto,
+    CommittedBlockProto, FileBlockLocationProto, FileTypeProto, LocatedBlockProto, OpenWriteModeProto, WriteHandleProto,
 };
 use ::beryl_common::Deadline;
 use ::beryl_common::error::rpc::{
@@ -31,7 +30,7 @@ use beryl_types::ids::{BlockId, BlockIndex, WorkerId};
 use beryl_types::layout::{BlockFormatId, BlockShape, FileLayout};
 use beryl_types::lease::{FencingToken, LeaseEpoch, WriteHandle};
 use beryl_types::{
-    CallId, ClientId, CommittedBlock, FileAttrs, FileBlockLocation, FileType, GroupName, GroupStateWatermark, InodeId,
+    CallId, ClientId, CommittedBlock, FileBlockLocation, FileType, GroupName, GroupStateWatermark, InodeId,
     LocatedBlock, RaftLogId, Tier, WorkerEndpointInfo, WorkerNetProtocol, WorkerRunId, WriteMode,
 };
 
@@ -147,43 +146,6 @@ impl From<FileLayout> for FileLayoutProto {
 // FS Domain Conversions
 // ============================================================================
 
-impl From<FileAttrsProto> for FileAttrs {
-    fn from(attrs: FileAttrsProto) -> Self {
-        Self {
-            mode: attrs.mode,
-            uid: attrs.uid,
-            gid: attrs.gid,
-            size: attrs.size,
-            atime_ms: attrs.atime_ms,
-            mtime_ms: attrs.mtime_ms,
-            ctime_ms: attrs.ctime_ms,
-            nlink: attrs.nlink,
-        }
-    }
-}
-
-impl From<&FileAttrs> for FileAttrsProto {
-    fn from(attrs: &FileAttrs) -> Self {
-        Self {
-            mode: attrs.mode,
-            uid: attrs.uid,
-            gid: attrs.gid,
-            size: attrs.size,
-            atime_ms: attrs.atime_ms,
-            mtime_ms: attrs.mtime_ms,
-            ctime_ms: attrs.ctime_ms,
-            nlink: attrs.nlink,
-        }
-    }
-}
-
-impl From<FileAttrs> for FileAttrsProto {
-    fn from(attrs: FileAttrs) -> Self {
-        Self::from(&attrs)
-    }
-}
-
-/// Reject an unspecified tag instead of guessing the namespace entry type.
 impl TryFrom<FileTypeProto> for FileType {
     type Error = String;
 
@@ -191,7 +153,6 @@ impl TryFrom<FileTypeProto> for FileType {
         match kind {
             FileTypeProto::FileTypeFile => Ok(Self::File),
             FileTypeProto::FileTypeDir => Ok(Self::Dir),
-            FileTypeProto::FileTypeSymlink => Ok(Self::Symlink),
             FileTypeProto::FileTypeUnspecified => Err("unspecified inode kind is not a domain value".to_string()),
         }
     }
@@ -203,7 +164,6 @@ impl From<FileType> for FileTypeProto {
         match kind {
             FileType::File => Self::FileTypeFile,
             FileType::Dir => Self::FileTypeDir,
-            FileType::Symlink => Self::FileTypeSymlink,
         }
     }
 }
@@ -396,8 +356,8 @@ impl TryFrom<LocatedBlockProto> for LocatedBlock {
         if target.worker_endpoints.is_empty() {
             return Err("LocatedBlockProto.worker_endpoints must not be empty".to_string());
         }
-        if target.block_stamp == 0 {
-            return Err("LocatedBlockProto.block_stamp must be non-zero".to_string());
+        if target.write_offset >= target.block_size {
+            return Err("LocatedBlockProto.write_offset must be below block capacity".to_string());
         }
         let tier = parse_known_tier(target.tier).map_err(|err| format!("LocatedBlockProto.tier invalid: {err}"))?;
         let block_id = required_block_id(target.block_id, "LocatedBlockProto.block_id")?;
@@ -416,10 +376,11 @@ impl TryFrom<LocatedBlockProto> for LocatedBlock {
         Ok(Self {
             block_id,
             file_offset: target.file_offset,
+            write_offset: target.write_offset,
             block_size: target.block_size,
             worker_endpoints,
             fencing_token,
-            block_stamp: target.block_stamp,
+
             chunk_size: target.chunk_size,
             block_format_id,
             tier,
@@ -432,9 +393,10 @@ impl From<&LocatedBlock> for LocatedBlockProto {
         Self {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
+            write_offset: target.write_offset,
             worker_endpoints: target.worker_endpoints.iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
-            block_stamp: target.block_stamp,
+
             chunk_size: target.chunk_size,
             block_format_id: target.block_format_id.as_raw(),
             block_size: target.block_size,
@@ -448,9 +410,10 @@ impl From<LocatedBlock> for LocatedBlockProto {
         Self {
             block_id: Some(target.block_id.into()),
             file_offset: target.file_offset,
+            write_offset: target.write_offset,
             worker_endpoints: target.worker_endpoints.into_iter().map(Into::into).collect(),
             fencing_token: Some(target.fencing_token.into()),
-            block_stamp: target.block_stamp,
+
             chunk_size: target.chunk_size,
             block_format_id: target.block_format_id.as_raw(),
             block_size: target.block_size,
@@ -466,7 +429,7 @@ impl TryFrom<CommittedBlockProto> for CommittedBlock {
         let block_id = required_block_id(block.block_id, "CommittedBlockProto.block_id")?;
         Ok(Self {
             block_id,
-            file_offset: block.file_offset,
+
             len: block.len,
         })
     }
@@ -476,7 +439,7 @@ impl From<&CommittedBlock> for CommittedBlockProto {
     fn from(block: &CommittedBlock) -> Self {
         Self {
             block_id: Some(block.block_id.into()),
-            file_offset: block.file_offset,
+
             len: block.len,
         }
     }
@@ -486,7 +449,7 @@ impl From<CommittedBlock> for CommittedBlockProto {
     fn from(block: CommittedBlock) -> Self {
         Self {
             block_id: Some(block.block_id.into()),
-            file_offset: block.file_offset,
+
             len: block.len,
         }
     }
@@ -499,12 +462,7 @@ impl TryFrom<FileBlockLocationProto> for FileBlockLocation {
         if location.len == 0 {
             return Err("FileBlockLocationProto.len must be non-zero".to_string());
         }
-        let block_stamp = location
-            .block_stamp
-            .ok_or_else(|| "FileBlockLocationProto.block_stamp missing".to_string())?;
-        if block_stamp == 0 {
-            return Err("FileBlockLocationProto.block_stamp must be non-zero".to_string());
-        }
+
         let block_format_id = BlockFormatId::from_raw(location.block_format_id)
             .map_err(|err| format!("FileBlockLocationProto.block_format_id invalid: {err}"))?;
         BlockShape::new(
@@ -525,7 +483,6 @@ impl TryFrom<FileBlockLocationProto> for FileBlockLocation {
             file_offset: location.file_offset,
             len: location.len,
             workers,
-            block_stamp,
             block_format_id,
             block_size: location.block_size,
             chunk_size: location.chunk_size,
@@ -541,7 +498,7 @@ impl From<&FileBlockLocation> for FileBlockLocationProto {
             file_offset: location.file_offset,
             len: location.len,
             workers: location.workers.iter().map(Into::into).collect(),
-            block_stamp: Some(location.block_stamp),
+
             block_format_id: location.block_format_id.as_raw(),
             block_size: location.block_size,
             chunk_size: location.chunk_size,
@@ -557,7 +514,7 @@ impl From<FileBlockLocation> for FileBlockLocationProto {
             file_offset: location.file_offset,
             len: location.len,
             workers: location.workers.into_iter().map(Into::into).collect(),
-            block_stamp: Some(location.block_stamp),
+
             block_format_id: location.block_format_id.as_raw(),
             block_size: location.block_size,
             chunk_size: location.chunk_size,
@@ -839,7 +796,6 @@ fn worker_kind_proto_to_kind(kind: WorkerErrorKindProto) -> Option<WorkerErrorKi
         WorkerErrorKindProto::WorkerErrorKindDescriptorMismatch => WorkerErrorKind::DescriptorMismatch,
         WorkerErrorKindProto::WorkerErrorKindFullReportRequired => WorkerErrorKind::FullReportRequired,
         WorkerErrorKindProto::WorkerErrorKindBlockLocationUnavailable => WorkerErrorKind::BlockLocationUnavailable,
-        WorkerErrorKindProto::WorkerErrorKindBlockStampMismatch => WorkerErrorKind::BlockStampMismatch,
         WorkerErrorKindProto::WorkerErrorKindNodeUnavailable => WorkerErrorKind::NodeUnavailable,
         WorkerErrorKindProto::WorkerErrorKindTimeout => WorkerErrorKind::Timeout,
         WorkerErrorKindProto::WorkerErrorKindResourceExhausted => WorkerErrorKind::ResourceExhausted,
@@ -859,7 +815,6 @@ fn worker_kind_to_proto(kind: WorkerErrorKind) -> WorkerErrorKindProto {
         WorkerErrorKind::DescriptorMismatch => WorkerErrorKindProto::WorkerErrorKindDescriptorMismatch,
         WorkerErrorKind::FullReportRequired => WorkerErrorKindProto::WorkerErrorKindFullReportRequired,
         WorkerErrorKind::BlockLocationUnavailable => WorkerErrorKindProto::WorkerErrorKindBlockLocationUnavailable,
-        WorkerErrorKind::BlockStampMismatch => WorkerErrorKindProto::WorkerErrorKindBlockStampMismatch,
         WorkerErrorKind::NodeUnavailable => WorkerErrorKindProto::WorkerErrorKindNodeUnavailable,
         WorkerErrorKind::Timeout => WorkerErrorKindProto::WorkerErrorKindTimeout,
         WorkerErrorKind::ResourceExhausted => WorkerErrorKindProto::WorkerErrorKindResourceExhausted,
@@ -1061,7 +1016,7 @@ mod tests {
 
     #[test]
     fn write_domain_values_preserve_wire_identity_and_intent() {
-        for (kind, raw) in [(FileType::File, 1), (FileType::Dir, 2), (FileType::Symlink, 3)] {
+        for (kind, raw) in [(FileType::File, 1), (FileType::Dir, 2)] {
             let wire = FileTypeProto::from(kind);
             assert_eq!(wire as i32, raw);
             assert_eq!(FileType::try_from(wire).unwrap(), kind);
@@ -1160,13 +1115,14 @@ mod tests {
         let token = FencingToken::new(block_id, ClientId::new(9), LeaseEpoch::new(17));
 
         let mut target = LocatedBlockProto {
+            write_offset: 0,
             block_id: Some(block_id.into()),
             file_offset: 128,
             worker_endpoints: Vec::new(),
             fencing_token: Some(token.into()),
-            block_stamp: 55,
-            chunk_size: BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size,
-            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
+
+            chunk_size: BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size,
+            block_format_id: BlockFormatId::DURABLE_PREFIX.as_raw(),
             block_size: 4096,
             tier: TierProto::TierHdd as i32,
         };
@@ -1175,30 +1131,25 @@ mod tests {
         target.worker_endpoints.push(endpoint());
         let decoded = LocatedBlock::try_from(target.clone()).expect("valid allocated block");
         assert_eq!(LocatedBlockProto::from(decoded), target);
-        target.block_stamp = 0;
-        let err = LocatedBlock::try_from(target).expect_err("zero target block_stamp must fail");
-        assert!(err.contains("block_stamp"));
+        target.write_offset = target.block_size;
+        assert!(LocatedBlock::try_from(target).is_err());
 
         let mut location = FileBlockLocationProto {
             block_id: Some(block_id.into()),
             file_offset: 128,
             len: 4096,
             workers: Vec::new(),
-            block_stamp: Some(55),
-            block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
+
+            block_format_id: BlockFormatId::DURABLE_PREFIX.as_raw(),
             block_size: 4096,
-            chunk_size: BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size,
+            chunk_size: BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size,
             effective_len: 4096,
         };
         let decoded_empty =
             FileBlockLocation::try_from(location.clone()).expect("empty read location workers are valid");
         assert!(decoded_empty.workers.is_empty());
         location.workers.push(endpoint());
-        location.block_stamp = None;
-        let err = FileBlockLocation::try_from(location.clone()).expect_err("missing block_stamp must fail");
-        assert!(err.contains("block_stamp missing"));
-        location.block_stamp = Some(0);
-        let err = FileBlockLocation::try_from(location).expect_err("zero block_stamp must fail");
-        assert!(err.contains("block_stamp"));
+        let decoded = FileBlockLocation::try_from(location.clone()).expect("valid read location");
+        assert_eq!(FileBlockLocationProto::from(decoded), location);
     }
 }

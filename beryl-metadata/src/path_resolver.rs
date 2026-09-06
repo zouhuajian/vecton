@@ -237,7 +237,7 @@ impl PathResolver {
             .get_inode(parent_inode_id)?
             .ok_or_else(|| MetadataError::NotFound(format!("Parent inode not found: {}", parent_inode_id)))?;
 
-        if !parent_inode.kind.is_dir() {
+        if !parent_inode.file_type().is_dir() {
             return Err(MetadataError::NotDir(format!(
                 "Parent is not a directory: {}",
                 parent_inode_id

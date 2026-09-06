@@ -23,7 +23,7 @@ pub mod raft_log_id;
 pub mod tier;
 pub mod worker;
 
-pub use fs::{ContentGeneration, Extent, FileAttrs, FileType, MAX_FILE_EXTENTS, WriteMode};
+pub use fs::{ContentGeneration, FileType, MAX_FILE_BLOCKS, WriteMode};
 pub use group_watermark::{GroupStateWatermark, MountEpoch};
 pub use ids::{BlockId, BlockIndex, CallId, ClientId, GroupName, GroupNameError, InodeId, MountId, WorkerId};
 pub use layout::{

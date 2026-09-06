@@ -16,7 +16,7 @@ use crate::runtime::{
     is_definite_worker_capacity_rejection, AttemptContext, ClientIdentity, MetadataTargets, Operation,
     OperationContext, OperationDeadline,
 };
-use crate::session::write_session::{ReadyBlock, WriteSession};
+use crate::session::write_session::WriteSession;
 use crate::worker::{BlockWrite, WorkerClient};
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RecoveryAction, WorkerErrorKind};
 use bytes::Bytes;
@@ -61,28 +61,40 @@ impl ClientInner {
         })
     }
 
-    /// Allocates one metadata block, then opens its Worker stream through the
-    /// staging acknowledgement boundary. Only a marked capacity rejection
-    /// before Worker side effects is retried; all attempts reuse one target.
+    /// Reopens the partial tail or allocates a new block, then crosses the Worker acknowledgement boundary.
+    /// Only an explicit capacity rejection before side effects permits a retry.
     pub(crate) async fn open_block_write(
         &self,
         session: &mut WriteSession,
         deadline: OperationDeadline,
     ) -> ClientResult<BlockWrite> {
-        let (allocate_block_operation, allocate_block) = match self
-            .metadata
-            .allocate_block(
-                session.path(),
-                session.write_handle(),
-                session.previous_block_id(),
-                deadline.clone(),
+        let (allocate_block_operation, allocate_block) = if let Some((group_name, block)) = session.reusable_tail() {
+            (
+                worker_write_context(
+                    self.metadata.client_id(),
+                    self.metadata.client_name(),
+                    Operation::WriteBlock,
+                    session.path(),
+                    deadline.clone(),
+                )?,
+                crate::metadata::model::AllocateBlockResult { group_name, block },
             )
-            .await
-        {
-            Ok(allocate_block) => allocate_block,
-            Err(err) => {
-                mark_session_after_write_error(session, &err);
-                return Err(self.normalize_outcome_error("AllocateBlock", "metadata", err));
+        } else {
+            match self
+                .metadata
+                .allocate_block(
+                    session.path(),
+                    session.write_handle(),
+                    session.previous_block_id(),
+                    deadline.clone(),
+                )
+                .await
+            {
+                Ok(allocate_block) => allocate_block,
+                Err(err) => {
+                    mark_session_after_write_error(session, &err);
+                    return Err(self.normalize_outcome_error("AllocateBlock", "metadata", err));
+                }
             }
         };
         if let Err(err) = session.validate_target(&allocate_block.block) {
@@ -98,6 +110,7 @@ impl ClientInner {
             return Err(side_effect_response_body_mismatch("AllocateBlock", err)
                 .with_operation_context(&allocate_block_operation));
         }
+        session.record_write_group(allocate_block.group_name.clone())?;
         let operation = worker_write_context(
             self.metadata.client_id(),
             self.metadata.client_name(),
@@ -216,7 +229,7 @@ impl ClientInner {
 
     /// Converts durable Worker blocks into the Metadata visibility-barrier shape.
     pub(crate) fn committed_blocks_for_barrier(&self, session: &WriteSession) -> Vec<beryl_types::CommittedBlock> {
-        session.ready_blocks().iter().map(committed_block_from_ready).collect()
+        session.publication_blocks()
     }
 
     /// Builds a data-plane attempt context under the public operation deadline.
@@ -395,16 +408,6 @@ fn worker_write_context(
     OperationContext::new_named(client_id, client_name, operation, Some(path.to_string()), deadline)
 }
 
-/// Converts a durable Worker block into the Metadata committed-block shape.
-fn committed_block_from_ready(block: &ReadyBlock) -> beryl_types::CommittedBlock {
-    let target = block.target();
-    beryl_types::CommittedBlock {
-        block_id: target.block_id,
-        file_offset: target.file_offset,
-        len: block.written_len(),
-    }
-}
-
 /// Marks a write session after a worker write or add-block failure.
 fn mark_session_after_write_error(session: &mut WriteSession, err: &ClientError) {
     if has_uncertain_write_effect(err) {
@@ -439,7 +442,7 @@ fn is_write_refresh_error(err: &ClientError) -> bool {
                     MetadataErrorKind::RouteEpochMismatch
                         | MetadataErrorKind::OwnerGroupMismatch
                         | MetadataErrorKind::StaleState
-                ) | ErrorKind::Worker(WorkerErrorKind::RunMismatch | WorkerErrorKind::BlockStampMismatch)
+                ) | ErrorKind::Worker(WorkerErrorKind::RunMismatch)
             )
     })
 }

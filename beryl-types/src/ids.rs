@@ -65,7 +65,7 @@ macro_rules! id_new_uint {
 /// Inode identifier (64-bit).
 ///
 /// Inodes are the authoritative identity for filesystem objects.
-/// Each mount has a root inode, and all files/directories/symlinks have unique inodes.
+/// Each mount has a root inode, and all files and directories have unique inodes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 #[repr(transparent)]

@@ -24,10 +24,10 @@ use beryl_proto::metadata::get_block_locations_request_proto::Target;
 use beryl_proto::metadata::{
     AbortFileWriteRequestProto, AbortFileWriteResponseProto, AllocateBlockRequestProto, CommitFileRequestProto,
     CommitFileResponseProto, CreateDirectoryRequestProto, CreateDirectoryResponseProto, CreateFileRequestProto,
-    DeleteOptionsProto, DeleteRequestProto, FileAttrsProto, FileTypeProto, GetBlockLocationsRequestProto,
-    GetStatusRequestProto, GetStatusResponseProto, ListStatusRequestProto, ListStatusResponseProto, MsyncRequestProto,
-    OpenFileRequestProto, OpenWriteModeProto, OpenWriteRequestProto, OpenWriteResponseProto, RenameRequestProto,
-    RenewLeaseRequestProto, SyncWriteRequestProto,
+    DeleteOptionsProto, DeleteRequestProto, FileTypeProto, GetBlockLocationsRequestProto, GetStatusRequestProto,
+    GetStatusResponseProto, ListStatusRequestProto, ListStatusResponseProto, MsyncRequestProto, OpenFileRequestProto,
+    OpenWriteModeProto, OpenWriteRequestProto, OpenWriteResponseProto, RenameRequestProto, RenewLeaseRequestProto,
+    SyncWriteRequestProto,
 };
 use beryl_types::{
     BlockId, ClientId, ContentGeneration, FileLayout, FileType, GroupName, InodeId, WriteHandle, WriteMode,
@@ -143,7 +143,6 @@ impl MetadataClient {
         let request = CreateDirectoryRequestProto {
             header: None,
             path: path.clone(),
-            attrs: Some(default_dir_attrs()),
             recursive: create_parent,
         };
         let response = self
@@ -791,19 +790,6 @@ fn timeout_error(target_plane: &str, operation: &str) -> ClientError {
     )))
 }
 
-fn default_dir_attrs() -> FileAttrsProto {
-    FileAttrsProto {
-        mode: 0o755,
-        uid: 0,
-        gid: 0,
-        size: 0,
-        atime_ms: 0,
-        mtime_ms: 0,
-        ctime_ms: 0,
-        nlink: 2,
-    }
-}
-
 /// Converts a validated open-write response into the sole client-side session
 /// state consumed by `FileWriter`.
 fn write_session_from_open_response(
@@ -832,7 +818,7 @@ fn write_session_from_open_response(
                 .with_operation_context(operation),
         );
     }
-    WriteSession::new(
+    let mut session = WriteSession::new(
         path,
         layout,
         write_handle,
@@ -841,22 +827,47 @@ fn write_session_from_open_response(
         ContentGeneration::new(response.generation),
         mode,
     )
-    .map_err(|error| side_effect_response_body_mismatch("OpenWrite", error).with_operation_context(operation))
+    .map_err(|error| side_effect_response_body_mismatch("OpenWrite", error).with_operation_context(operation))?;
+    let group = response
+        .header
+        .as_ref()
+        .ok_or_else(|| ClientError::invalid_layout("OpenWrite header missing"))?
+        .group_name
+        .as_str();
+    let group = beryl_types::GroupName::parse(group)
+        .map_err(|error| side_effect_response_body_mismatch("OpenWrite", error).with_operation_context(operation))?;
+    let tail = response
+        .tail_block
+        .map(TryInto::try_into)
+        .transpose()
+        .map_err(|error: String| {
+            side_effect_response_body_mismatch("OpenWrite", error).with_operation_context(operation)
+        })?;
+    session
+        .accept_open_tail(group, tail)
+        .map_err(|error| side_effect_response_body_mismatch("OpenWrite", error).with_operation_context(operation))?;
+    Ok(session)
 }
 
 fn file_status_from_response(path: String, response: GetStatusResponseProto) -> ClientResult<FileStatus> {
-    let attrs = response
-        .attrs
-        .ok_or_else(|| invalid_response("GetStatus", "GetStatusResponseProto.attrs missing"))?;
     let kind = file_type_from_wire("GetStatus", response.kind)?;
-    Ok(FileStatus::new(path, kind, attrs.into()))
+    Ok(FileStatus::new(
+        path,
+        kind,
+        response.len,
+        response.create_time,
+        response.modify_time,
+    ))
 }
 
 fn directory_status_from_response(path: String, response: CreateDirectoryResponseProto) -> ClientResult<FileStatus> {
-    let attrs = response.attrs.ok_or_else(|| {
-        side_effect_response_body_mismatch("CreateDirectory", "CreateDirectoryResponseProto.attrs missing")
-    })?;
-    Ok(FileStatus::new(path, FileType::Dir, attrs.into()))
+    Ok(FileStatus::new(
+        path,
+        FileType::Dir,
+        0,
+        response.create_time,
+        response.modify_time,
+    ))
 }
 
 /// Converts a successful wire page while enforcing its cursor/EOF invariant.
@@ -886,16 +897,19 @@ fn list_status_page_from_response(path: String, response: ListStatusResponseProt
                 ));
             }
             let kind = file_type_from_wire("ListStatus", entry.kind)?;
-            let attrs = entry
-                .attrs
-                .ok_or_else(|| invalid_response("ListStatus", "DirEntryProto.attrs missing"))?;
             let parent = path.trim_end_matches('/');
             let child_path = if parent.is_empty() {
                 format!("/{}", entry.name)
             } else {
                 format!("{parent}/{}", entry.name)
             };
-            Ok(FileStatus::new(child_path, kind, attrs.into()))
+            Ok(FileStatus::new(
+                child_path,
+                kind,
+                entry.len,
+                entry.create_time,
+                entry.modify_time,
+            ))
         })
         .collect::<ClientResult<Vec<_>>>()?;
     Ok(ListStatusPage {

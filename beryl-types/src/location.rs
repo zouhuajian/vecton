@@ -28,7 +28,10 @@ pub struct LocatedBlock {
     /// Selected Worker process identities retained unchanged when allocation replays.
     pub worker_endpoints: Vec<WorkerEndpointInfo>,
     pub fencing_token: FencingToken,
-    pub block_stamp: u64,
+    /// Block-local start of the next write: zero for allocation, the visible
+    /// prefix for OpenWrite, or a locally confirmed checkpoint for continuation.
+    pub write_offset: u64,
+
     pub chunk_size: u32,
     /// Metadata-selected Beryl block data/meta interpretation format.
     pub block_format_id: BlockFormatId,
@@ -36,11 +39,11 @@ pub struct LocatedBlock {
     pub tier: Tier,
 }
 
-/// Metadata commit payload for one worker-published block.
+/// Changed tail or new block included in a Metadata content publication.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedBlock {
     pub block_id: BlockId,
-    pub file_offset: u64,
+    /// Total block length, including the previously visible tail prefix.
     pub len: u64,
 }
 
@@ -53,7 +56,7 @@ pub struct FileBlockLocation {
     /// Metadata-issued read candidates. Empty means the authoritative layout has
     /// this block range but no live reported replica is currently eligible.
     pub workers: Vec<WorkerEndpointInfo>,
-    pub block_stamp: u64,
+
     /// Metadata-selected Beryl block data/meta interpretation format.
     pub block_format_id: BlockFormatId,
     /// Full logical block size from the persisted `FileLayout`.

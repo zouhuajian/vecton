@@ -302,6 +302,7 @@ async fn run_worker(config: WorkerConfig, termination: &mut TerminationMonitor) 
         &config.net,
         Arc::clone(&core),
         Arc::clone(&registration_state),
+        &config.metadata,
     ) {
         Ok(rpc) => rpc,
         Err(error) => {

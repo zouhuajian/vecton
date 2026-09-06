@@ -276,19 +276,20 @@ impl MetadataWorkerServiceImpl {
                 ));
             }
         };
-        if block.block_stamp == 0 {
+        if block_state == BlockReportBlockState::Ready && block.lease_epoch == 0 {
             return Err(MetadataError::InvalidArgument(
-                "block report entry block_stamp must be non-zero".to_string(),
+                "Ready block report entry lease_epoch must be non-zero".to_string(),
             ));
         }
-        if block_state == BlockReportBlockState::Ready && block.effective_len == 0 {
-            return Err(MetadataError::InvalidArgument(
-                "Ready block report entry effective_len must be greater than zero".to_string(),
-            ));
-        }
+        let tier = if block_state == BlockReportBlockState::Ready {
+            Some(beryl_proto::convert::parse_known_tier(block.tier).map_err(MetadataError::InvalidArgument)?)
+        } else {
+            None
+        };
         Ok(BlockReportBlock {
+            tier,
             block_id,
-            block_stamp: block.block_stamp,
+            lease_epoch: block.lease_epoch,
             block_state,
             effective_len: block.effective_len,
         })
@@ -864,7 +865,6 @@ impl MetadataWorkerServiceProto for MetadataWorkerServiceImpl {
                 .into_iter()
                 .map(|command| BlockCleanupCommandProto {
                     block_id: Some(command.block_id.into()),
-                    expected_block_stamp: command.expected_block_stamp,
                 })
                 .collect();
 
@@ -1405,8 +1405,9 @@ mod tests {
                 0,
                 true,
                 vec![BlockReportBlock {
+                    tier: Some(beryl_types::Tier::Hdd),
                     block_id,
-                    block_stamp: 100,
+                    lease_epoch: 100,
                     block_state: BlockReportBlockState::Ready,
                     effective_len: 64,
                 }],
@@ -1631,7 +1632,7 @@ mod tests {
         .expect("initial heartbeat succeeds");
 
         let block_id = BlockId::new(InodeId::new(700), BlockIndex::new(0));
-        let block_stamp = 991;
+        let lease_epoch = 991;
         worker_manager
             .receive_full_block_report(
                 &group,
@@ -1641,8 +1642,9 @@ mod tests {
                 0,
                 true,
                 vec![BlockReportBlock {
+                    tier: Some(beryl_types::Tier::Hdd),
                     block_id,
-                    block_stamp,
+                    lease_epoch,
                     block_state: BlockReportBlockState::Ready,
                     effective_len: 64,
                 }],
@@ -1663,6 +1665,5 @@ mod tests {
         assert_eq!(response.cleanup_commands.len(), 1);
         let command = &response.cleanup_commands[0];
         assert_eq!(command.block_id, Some(block_id.into()));
-        assert_eq!(command.expected_block_stamp, block_stamp);
     }
 }

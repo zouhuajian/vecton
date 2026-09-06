@@ -34,11 +34,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     writer.close().await?;
 
     let status = client.get_status(FILE).await?;
-    if status.attrs.size != payload.len() as u64 {
+    if status.len != payload.len() as u64 {
         return Err(io::Error::other(format!(
             "stat size mismatch: expected {}, got {}",
             payload.len(),
-            status.attrs.size
+            status.len
         ))
         .into());
     }

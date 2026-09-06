@@ -157,9 +157,10 @@ impl DetachedRootReclaimer {
 mod tests {
     use super::*;
     use crate::config::RaftConfig;
+    use crate::inode::InodeAttrs;
     use crate::mount::{MountTable, ROOT_INODE_ID};
     use crate::raft::AppRaftStateMachine;
-    use beryl_types::fs::FileAttrs;
+
     use beryl_types::ids::MountId;
     use beryl_types::GroupName;
     use std::time::Duration;
@@ -220,7 +221,7 @@ mod tests {
                 proposed_at_ms: 2,
                 root_inode_id: ROOT_INODE_ID,
                 components: vec!["detached".to_string()],
-                attrs: FileAttrs::new(),
+                attrs: InodeAttrs::new(),
                 recursive: false,
             })
             .await

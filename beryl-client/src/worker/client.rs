@@ -53,11 +53,6 @@ impl WorkerClient {
         }
         let mut remaining = output;
         for block_read in block_reads {
-            if block_read.block_stamp == 0 {
-                return Err(ClientError::invalid_layout(
-                    "planned block read has zero block_stamp".to_string(),
-                ));
-            }
             let expected_end = block_read
                 .file_offset
                 .checked_add(u64::from(block_read.len))
@@ -77,7 +72,7 @@ impl WorkerClient {
     }
 
     /// Opens one Metadata-authorized block RPC and returns only after the
-    /// transport has crossed Worker's staging acknowledgement boundary.
+    /// transport has crossed Worker's block-open acknowledgement boundary.
     pub(crate) async fn open_write_block(
         &self,
         attempt: AttemptContext,

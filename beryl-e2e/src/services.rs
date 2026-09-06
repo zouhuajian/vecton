@@ -137,10 +137,16 @@ pub struct WorkerServiceInstance {
 }
 
 impl WorkerServiceInstance {
-    pub fn start(listener: TcpListener, core: Arc<WorkerCore>, registration_state: Arc<RegistrationSet>) -> Self {
+    pub fn start(
+        listener: TcpListener,
+        core: Arc<WorkerCore>,
+        registration_state: Arc<RegistrationSet>,
+        metadata: beryl_worker::config::WorkerRegistrationConfig,
+    ) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let service = WorkerDataServiceImpl::new(core, registration_state, 64, 32);
+            let service = WorkerDataServiceImpl::new(core, registration_state, 64, 32, &metadata)
+                .expect("data service configuration");
             Server::builder()
                 .add_service(WorkerDataServiceServer::new(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {

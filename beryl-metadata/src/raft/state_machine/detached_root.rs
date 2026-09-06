@@ -165,21 +165,12 @@ impl AppRaftStateMachine {
                 root_inode.inode_id
             )));
         }
-        if root_inode.kind != root_inode.data.kind() {
-            return Err(MetadataError::Internal(format!(
-                "DetachedRoot inode {root_inode_id} kind and payload disagree"
-            )));
-        }
-        if !root_inode.kind.is_dir() {
+        if !root_inode.file_type().is_dir() {
             return Err(MetadataError::Internal(format!(
                 "DetachedRoot inode {root_inode_id} is not a directory"
             )));
         }
-        if self.storage.get_layout_optional(root_inode_id)?.is_some() {
-            return Err(MetadataError::Internal(format!(
-                "DetachedRoot directory inode {root_inode_id} carries file authority"
-            )));
-        }
+
         if root_inode.mount_id != detached_root.mount_id {
             return Err(MetadataError::Internal(format!(
                 "DetachedRoot inode {root_inode_id} belongs to mount {}, marker names mount {}",
@@ -240,11 +231,6 @@ impl AppRaftStateMachine {
                 child_inode.inode_id
             )));
         }
-        if child_inode.kind != child_inode.data.kind() {
-            return Err(MetadataError::Internal(format!(
-                "inode {child_inode_id} under DetachedRoot {parent_inode_id} has kind/payload mismatch"
-            )));
-        }
         if child_inode.mount_id != parent_detached_root.mount_id {
             return Err(MetadataError::Internal(format!(
                 "DetachedRoot inode {parent_inode_id} crosses from mount {} to child inode {child_inode_id} in mount {}",
@@ -252,43 +238,22 @@ impl AppRaftStateMachine {
             )));
         }
 
-        let (remove_file_layout, child_detached_root) = match child_inode.data {
-            InodeData::Dir => {
-                if self.storage.get_layout_optional(child_inode_id)?.is_some() {
-                    return Err(MetadataError::Internal(format!(
-                        "directory inode {child_inode_id} under DetachedRoot {parent_inode_id} carries file authority"
-                    )));
-                }
+        let child_detached_root = match child_inode.kind {
+            InodeKind::Dir => {
                 if child_inode_id == mount_root_inode_id {
                     return Err(MetadataError::Internal(format!(
                         "DetachedRoot inode {parent_inode_id} reaches mount root inode {child_inode_id}"
                     )));
                 }
-                (false, Some(parent_detached_root))
+                Some(parent_detached_root)
             }
-            InodeData::File { .. } => {
-                if self.storage.get_layout_optional(child_inode_id)?.is_none() {
-                    return Err(MetadataError::Internal(format!(
-                        "detached file inode {child_inode_id} has no file layout"
-                    )));
-                }
-                (true, None)
-            }
-            InodeData::Symlink { .. } => {
-                if self.storage.get_layout_optional(child_inode_id)?.is_some() {
-                    return Err(MetadataError::Internal(format!(
-                        "symlink inode {child_inode_id} under DetachedRoot {parent_inode_id} carries file authority"
-                    )));
-                }
-                (false, None)
-            }
+            InodeKind::File(crate::inode::FileData { .. }) => None,
         };
 
         Ok(DetachedRootReclaimEntry {
             parent_inode_id,
             name,
             inode_id: child_inode_id,
-            remove_file_layout,
             child_detached_root,
         })
     }
@@ -297,7 +262,7 @@ impl AppRaftStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inode::InodeData;
+    use crate::inode::InodeKind;
     use crate::raft::state_machine::tests::*;
 
     fn new_state_machine() -> (TempDir, Arc<RocksDBStorage>, AppRaftStateMachine) {
@@ -317,13 +282,18 @@ mod tests {
 
     fn seed_directory(storage: &RocksDBStorage, inode_id: InodeId, mount_id: MountId) {
         storage
-            .put_inode(&Inode::new_dir(inode_id, FileAttrs::new(), mount_id))
+            .put_inode(&Inode::new_dir(inode_id, InodeAttrs::new(), mount_id))
             .unwrap();
     }
 
     fn seed_file(storage: &RocksDBStorage, parent_inode_id: InodeId, name: &str, inode_id: InodeId, mount_id: MountId) {
         storage
-            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
+            .put_inode(&Inode::new_file(
+                inode_id,
+                InodeAttrs::new(),
+                mount_id,
+                beryl_types::FileLayout::new(4096),
+            ))
             .unwrap();
         storage.put_dentry(parent_inode_id, name, inode_id).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
@@ -358,33 +328,28 @@ mod tests {
         }
     }
 
-    fn symlink_inode(inode_id: InodeId, attrs: FileAttrs, target: String, mount_id: MountId) -> Inode {
-        let mut inode = Inode::new(inode_id, beryl_types::FileType::Symlink, attrs, mount_id);
-        inode.data = InodeData::Symlink { target: Some(target) };
-        inode
-    }
-
     #[test]
     fn mixed_tree_reclaims_in_bounded_batches_and_inherits_detach_age() {
         let (_dir, storage, state_machine) = new_state_machine();
         let root_id = InodeId::new(10);
         let child_dir_id = InodeId::new(11);
         let file_id = InodeId::new(12);
-        let symlink_id = InodeId::new(13);
+        let second_file_id = InodeId::new(13);
         let marker = detached_root(MountId::new(1), 77);
         seed_directory(&storage, root_id, marker.mount_id);
         seed_directory(&storage, child_dir_id, marker.mount_id);
         storage.put_dentry(root_id, "a", child_dir_id).unwrap();
         seed_file(&storage, root_id, "b", file_id, marker.mount_id);
         storage
-            .put_inode(&symlink_inode(
-                symlink_id,
-                FileAttrs::new(),
-                "target".to_string(),
+            .put_inode(&Inode::new_file(
+                second_file_id,
+                InodeAttrs::new(),
                 marker.mount_id,
+                beryl_types::FileLayout::new(4096),
             ))
             .unwrap();
-        storage.put_dentry(root_id, "c", symlink_id).unwrap();
+        storage.put_layout(second_file_id, FileLayout::new(4096)).unwrap();
+        storage.put_dentry(root_id, "c", second_file_id).unwrap();
         storage.put_detached_root(root_id, marker).unwrap();
 
         let first = reclaim(&state_machine, vec![root_id], 2).unwrap();
@@ -402,7 +367,7 @@ mod tests {
         assert_eq!(second.completed_roots, 1);
         assert!(storage.get_inode(root_id).unwrap().is_none());
         assert!(storage.get_detached_root(root_id).unwrap().is_none());
-        assert!(storage.get_inode(symlink_id).unwrap().is_none());
+        assert!(storage.get_inode(second_file_id).unwrap().is_none());
 
         let third = reclaim(&state_machine, vec![child_dir_id], 2).unwrap();
         assert_eq!(third.processed_entries, 0);
@@ -459,8 +424,8 @@ mod tests {
         assert!(error.to_string().contains("invalid detached-root entry budget"));
         assert_eq!(storage.get_detached_root(root_id).unwrap(), Some(marker));
         assert!(matches!(
-            storage.get_inode(root_id).unwrap().unwrap().data,
-            InodeData::Dir
+            storage.get_inode(root_id).unwrap().unwrap().kind,
+            InodeKind::Dir
         ));
     }
 
@@ -474,13 +439,14 @@ mod tests {
             let inode_id = InodeId::new(81 + index);
             let name = format!("{index:03}-{}", "x".repeat(96));
             storage
-                .put_inode(&symlink_inode(
+                .put_inode(&Inode::new_file(
                     inode_id,
-                    FileAttrs::new(),
-                    "target".to_string(),
+                    InodeAttrs::new(),
                     marker.mount_id,
+                    beryl_types::FileLayout::new(4096),
                 ))
                 .unwrap();
+            storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
             storage.put_dentry(root_id, &name, inode_id).unwrap();
         }
         storage.put_detached_root(root_id, marker).unwrap();

@@ -96,7 +96,7 @@ impl FsClient {
         self.inner.metadata.mkdirs(path, options.create_parent).await
     }
 
-    /// Delete a file, symlink, or directory through the metadata client.
+    /// Delete a file or directory through the metadata client.
     ///
     /// Namespace visibility changes atomically at metadata. Physical block
     /// reclamation follows the configured metadata grace period asynchronously.

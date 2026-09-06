@@ -7,13 +7,13 @@
 //! operation, and map its result back to the wire response.
 
 use super::filesystem::{
-    AbortFileWriteArgs, AllocateBlockArgs, BlockLocationsTarget, CommitFileArgs, CreateDirectoryArgs, CreateFileArgs,
-    DeleteArgs, FileRange, Freshness, GetBlockLocationsArgs, GetStatusArgs, ListStatusArgs, OpenFileArgs,
-    OpenWriteArgs, RenameArgs, RenewLeaseArgs, SyncWriteArgs,
+    AbortFileWriteArgs, AllocateBlockArgs, AuthorizeBlockWriteArgs, BlockLocationsTarget, CommitFileArgs,
+    CreateDirectoryArgs, CreateFileArgs, DeleteArgs, FileRange, Freshness, GetBlockLocationsArgs, GetStatusArgs,
+    ListStatusArgs, OpenFileArgs, OpenWriteArgs, RenameArgs, RenewLeaseArgs, SyncWriteArgs,
 };
 use super::wire::{
-    file_attrs_from_proto, file_attrs_to_proto, header_from_fs_failure, header_from_rpc_error, located_block_to_proto,
-    location_to_proto, ok_header_from_fs_success, request_context_from_proto,
+    header_from_fs_failure, header_from_rpc_error, located_block_to_proto, location_to_proto,
+    ok_header_from_fs_success, request_context_from_proto,
 };
 use super::{MetadataFileSystem, MsyncHandler};
 use crate::config::{NamespaceListConfig, MAX_LIST_STATUS_PAGE_SIZE};
@@ -23,16 +23,17 @@ use beryl_proto::common::{RequestHeaderProto, ResponseHeaderProto};
 use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
 use beryl_proto::metadata::{
     get_block_locations_request_proto, AbortFileWriteRequestProto, AbortFileWriteResponseProto,
-    AllocateBlockRequestProto, AllocateBlockResponseProto, CommitFileRequestProto, CommitFileResponseProto,
-    CommittedBlockProto, CreateDirectoryRequestProto, CreateDirectoryResponseProto, CreateFileRequestProto,
-    CreateFileResponseProto, DeleteRequestProto, DeleteResponseProto, DirEntryProto, FileTypeProto,
-    GetBlockLocationsRequestProto, GetBlockLocationsResponseProto, GetStatusRequestProto, GetStatusResponseProto,
-    ListStatusRequestProto, ListStatusResponseProto, MsyncRequestProto, MsyncResponseProto, OpenFileRequestProto,
-    OpenFileResponseProto, OpenWriteRequestProto, OpenWriteResponseProto, RenameRequestProto, RenameResponseProto,
-    RenewLeaseRequestProto, RenewLeaseResponseProto, SyncWriteRequestProto, SyncWriteResponseProto, WriteHandleProto,
+    AllocateBlockRequestProto, AllocateBlockResponseProto, AuthorizeBlockWriteRequestProto,
+    AuthorizeBlockWriteResponseProto, CommitFileRequestProto, CommitFileResponseProto, CommittedBlockProto,
+    CreateDirectoryRequestProto, CreateDirectoryResponseProto, CreateFileRequestProto, CreateFileResponseProto,
+    DeleteRequestProto, DeleteResponseProto, DirEntryProto, FileTypeProto, GetBlockLocationsRequestProto,
+    GetBlockLocationsResponseProto, GetStatusRequestProto, GetStatusResponseProto, ListStatusRequestProto,
+    ListStatusResponseProto, MsyncRequestProto, MsyncResponseProto, OpenFileRequestProto, OpenFileResponseProto,
+    OpenWriteRequestProto, OpenWriteResponseProto, RenameRequestProto, RenameResponseProto, RenewLeaseRequestProto,
+    RenewLeaseResponseProto, SyncWriteRequestProto, SyncWriteResponseProto, WriteHandleProto,
 };
 use beryl_types::ids::InodeId;
-use beryl_types::{CommittedBlock, ContentGeneration, WriteHandle, WriteMode, MAX_FILE_EXTENTS};
+use beryl_types::{CommittedBlock, ContentGeneration, WriteHandle, WriteMode, MAX_FILE_BLOCKS};
 use get_block_locations_request_proto::Target;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -57,6 +58,7 @@ macro_rules! impl_header_response {
 }
 
 impl_header_response!(
+    AuthorizeBlockWriteResponseProto,
     GetStatusResponseProto,
     ListStatusResponseProto,
     CreateDirectoryResponseProto,
@@ -200,7 +202,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
         {
             Ok(success) => response_with_header!(
                 GetStatusResponseProto {
-                    attrs: Some(file_attrs_to_proto(&success.payload.attrs)),
+                    len: success.payload.len,
+                    create_time: success.payload.attrs.create_time,
+                    modify_time: success.payload.attrs.modify_time,
                     kind: FileTypeProto::from(success.payload.kind) as i32,
                     ..Default::default()
                 },
@@ -248,7 +252,9 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     .map(|entry| DirEntryProto {
                         name: entry.name,
                         kind: FileTypeProto::from(entry.kind) as i32,
-                        attrs: Some(file_attrs_to_proto(&entry.attrs)),
+                        len: entry.len,
+                        create_time: entry.attrs.create_time,
+                        modify_time: entry.attrs.modify_time,
                     })
                     .collect();
                 response_with_header!(
@@ -279,7 +285,6 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 &req_ctx,
                 CreateDirectoryArgs {
                     path: req.path,
-                    parsed_attrs: file_attrs_from_proto(req.attrs),
                     recursive: req.recursive,
                     freshness: Self::freshness_from_header(&req.header),
                 },
@@ -291,7 +296,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 let payload = success.payload;
                 response_with_header!(
                     CreateDirectoryResponseProto {
-                        attrs: Some(file_attrs_to_proto(&payload.attrs)),
+                        create_time: payload.attrs.create_time,
+                        modify_time: payload.attrs.modify_time,
                         ..Default::default()
                     },
                     header
@@ -556,12 +562,61 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                         expires_at_ms: payload.expires_at_ms,
                         layout: Some((&payload.layout).into()),
                         generation: payload.generation.as_raw(),
+                        tail_block: payload.tail_block.as_ref().map(located_block_to_proto),
                         ..Default::default()
                     },
                     header
                 )
             }
             Err(failure) => error_response!(OpenWriteResponseProto, header_from_fs_failure(&req_ctx, &failure)),
+        }
+    }
+
+    /// Converts Worker stream facts before checking online file-write authority.
+    async fn authorize_block_write(
+        &self,
+        request: Request<AuthorizeBlockWriteRequestProto>,
+    ) -> Result<Response<AuthorizeBlockWriteResponseProto>, Status> {
+        let req = request.into_inner();
+        let req_ctx = request_context_or_error!(req, AuthorizeBlockWriteResponseProto);
+        let args = (|| -> Result<AuthorizeBlockWriteArgs, String> {
+            Ok(AuthorizeBlockWriteArgs {
+                group_name: beryl_types::GroupName::parse(&req.group_name).map_err(|e| e.to_string())?,
+                worker_id: beryl_types::WorkerId::new(req.worker_id),
+                worker_run_id: beryl_proto::convert::require_worker_run_id(&req.worker_run_id, "worker_run_id")?,
+                fencing_token: beryl_proto::convert::required_fencing_token(req.fencing_token, "fencing_token")?,
+                write_offset: req.write_offset,
+                shape: beryl_types::layout::BlockShape::new(
+                    beryl_types::layout::BlockFormatId::from_raw(req.block_format_id).map_err(|e| e.to_string())?,
+                    req.block_size,
+                    req.chunk_size,
+                    req.block_size,
+                )
+                .map_err(|e| e.to_string())?,
+                tier: beryl_proto::convert::parse_known_tier(req.tier)?,
+            })
+        })();
+        let args = match args {
+            Ok(args) => args,
+            Err(error) => {
+                return error_response!(
+                    AuthorizeBlockWriteResponseProto,
+                    Self::header_from_conversion_error(&req.header, MetadataError::InvalidArgument(error))
+                )
+            }
+        };
+        match self.filesystem.authorize_block_write(&req_ctx, args).await {
+            Ok(success) => response_with_header!(
+                AuthorizeBlockWriteResponseProto {
+                    visible_len: success.payload,
+                    ..Default::default()
+                },
+                ok_header_from_fs_success(&req_ctx, &success)
+            ),
+            Err(failure) => error_response!(
+                AuthorizeBlockWriteResponseProto,
+                header_from_fs_failure(&req_ctx, &failure)
+            ),
         }
     }
 
@@ -637,7 +692,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
         };
-        if req.committed_blocks.len() > MAX_FILE_EXTENTS {
+        if req.committed_blocks.len() > MAX_FILE_BLOCKS {
             return error_response!(
                 CommitFileResponseProto,
                 Self::header_from_conversion_error(
@@ -645,7 +700,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     MetadataError::ResourceExhausted(format!(
                         "CommitFile committed block count {} exceeds maximum {}",
                         req.committed_blocks.len(),
-                        MAX_FILE_EXTENTS
+                        MAX_FILE_BLOCKS
                     )),
                 )
             );
@@ -779,7 +834,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                 )
             }
         };
-        if req.committed_blocks.len() > MAX_FILE_EXTENTS {
+        if req.committed_blocks.len() > MAX_FILE_BLOCKS {
             return error_response!(
                 SyncWriteResponseProto,
                 Self::header_from_conversion_error(
@@ -787,7 +842,7 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
                     MetadataError::ResourceExhausted(format!(
                         "SyncWrite committed block count {} exceeds maximum {}",
                         req.committed_blocks.len(),
-                        MAX_FILE_EXTENTS
+                        MAX_FILE_BLOCKS
                     )),
                 )
             );
@@ -845,7 +900,8 @@ impl FileSystemServiceProto for MetadataFileSystemServiceImpl {
 #[cfg(test)]
 mod tests {
     use crate::config::{NamespaceListConfig, RaftConfig};
-    use crate::inode::{Inode, InodeData};
+    use crate::inode::InodeAttrs;
+    use crate::inode::{Inode, InodeKind};
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable};
     use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
     use crate::service::{MetadataFileSystem, MetadataFileSystemDeps, MetadataFileSystemServiceImpl, MsyncHandler};
@@ -861,7 +917,7 @@ mod tests {
         AllocateBlockRequestProto, CommitFileRequestProto, CommittedBlockProto, CreateFileRequestProto,
         OpenWriteModeProto, SyncWriteRequestProto, WriteHandleProto,
     };
-    use beryl_types::fs::FileAttrs;
+
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
     use beryl_types::{ClientId, ContentGeneration, FileLayout, GroupName, LeaseEpoch, Tier, TierFree, WorkerRunId};
     use std::sync::Arc;
@@ -970,10 +1026,8 @@ mod tests {
             },
         );
 
-        let mut root_attrs = FileAttrs::new();
-        root_attrs.uid = 1000;
-        root_attrs.gid = 1000;
-        root_attrs.mode = 0o755;
+        let root_attrs = InodeAttrs::new();
+
         storage
             .put_inode(&Inode::new_dir(root_inode_id, root_attrs, mount_entry.mount_id))
             .expect("put root inode");
@@ -1064,10 +1118,10 @@ mod tests {
         env: &PathTestEnv,
         worker_id: WorkerId,
         block_id: BlockId,
-        block_stamp: u64,
+        lease_epoch: u64,
         effective_len: u64,
     ) {
-        publish_reported_locations(env, worker_id, vec![(block_id, block_stamp, effective_len)]);
+        publish_reported_locations(env, worker_id, vec![(block_id, lease_epoch, effective_len)]);
     }
 
     fn publish_reported_locations(env: &PathTestEnv, worker_id: WorkerId, blocks: Vec<(BlockId, u64, u64)>) {
@@ -1086,9 +1140,10 @@ mod tests {
                 true,
                 blocks
                     .into_iter()
-                    .map(|(block_id, block_stamp, effective_len)| BlockReportBlock {
+                    .map(|(block_id, lease_epoch, effective_len)| BlockReportBlock {
+                        tier: Some(beryl_types::Tier::Hdd),
                         block_id,
-                        block_stamp,
+                        lease_epoch,
                         block_state: BlockReportBlockState::Ready,
                         effective_len,
                     })
@@ -1145,12 +1200,12 @@ mod tests {
                 InodeId::new(reported_block_id.inode_id),
                 BlockIndex::new(reported_block_id.block_index),
             ),
-            target.block_stamp,
+            target.fencing_token.as_ref().unwrap().epoch,
             128,
         );
         let committed = CommittedBlockProto {
             block_id: target.block_id,
-            file_offset: target.file_offset,
+
             len: 128,
         };
 
@@ -1179,6 +1234,14 @@ mod tests {
         assert_success_header(first.header);
         let first_generation = first.generation.expect("content generation");
         let inode_id = InodeId::new(write_handle.inode_id);
+        // The first Replace Sync has already switched the active session to Append.
+        // Its frozen retry still resolves exactly, as required after a lost response.
+        let active_replay = FileSystemServiceProto::sync_write(&env.service, Request::new(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_success_header(active_replay.header);
+        assert_eq!(active_replay.generation, Some(first_generation));
         let mut foreign = request.clone();
         foreign.header = header(52);
         let rejected = FileSystemServiceProto::sync_write(&env.service, Request::new(foreign))
@@ -1234,7 +1297,7 @@ mod tests {
         );
         let inode = env.storage.get_inode(inode_id).unwrap().unwrap();
         assert!(
-            matches!(inode.data, InodeData::File { lease_epoch: Some(epoch), last_commit: None, .. }
+            matches!(inode.kind, InodeKind::File(crate::inode::FileData { lease_epoch: epoch, last_commit: None, .. })
             if epoch == LeaseEpoch::new(write_handle.write_lease_epoch))
         );
 
@@ -1246,7 +1309,6 @@ mod tests {
             .into_inner();
         let err = header_error(changed.header);
         assert_fail_kind(&err, ErrorKind::Protocol(ProtocolErrorKind::InvalidArgument));
-        assert!(err.message.contains("completed publish payload"));
     }
 
     #[tokio::test]
@@ -1272,17 +1334,17 @@ mod tests {
         assert_eq!(first.committed_size, 128);
         assert!(env.session_registry.get_session(inode_id).is_none());
         let inode = env.storage.get_inode(inode_id).unwrap().unwrap();
-        let InodeData::File {
+        let InodeKind::File(crate::inode::FileData {
             generation,
             lease_epoch,
             last_commit,
             ..
-        } = &inode.data
+        }) = &inode.kind
         else {
             panic!("file")
         };
-        assert_eq!(*generation, Some(ContentGeneration::new(expected_generation + 1)));
-        assert_eq!(*lease_epoch, Some(LeaseEpoch::new(write_handle.write_lease_epoch + 1)));
+        assert_eq!(*generation, ContentGeneration::new(expected_generation + 1));
+        assert_eq!(*lease_epoch, LeaseEpoch::new(write_handle.write_lease_epoch + 1));
         assert!(last_commit.is_some());
         env.worker_manager.as_ref().unwrap().reset_worker_soft_state();
         let replay = FileSystemServiceProto::commit_file(&env.service, Request::new(request.clone()))

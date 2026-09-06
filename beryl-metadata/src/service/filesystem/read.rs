@@ -8,15 +8,15 @@ use super::{
     FsFailure, FsResult, FsSuccess, MetadataFileSystem, RequestContext, StaleStateStatus, SUPPORTED_REPLICA_COUNT,
 };
 use crate::error::MetadataError;
-use crate::inode::{Inode, InodeData};
+use crate::inode::InodeAttrs;
 use crate::observe;
 use crate::placement::{
     PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus, ReportedBlockLocation, WorkerPlacementView,
 };
 use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, RefreshHint, WorkerErrorKind};
 use beryl_common::header::CallerContextFields;
-use beryl_types::fs::{Extent, FileAttrs, FileType};
 use beryl_types::ids::{InodeId, MountId};
+use beryl_types::FileType;
 use beryl_types::{ContentGeneration, FileBlockLocation, GroupName};
 use std::time::Instant;
 
@@ -30,7 +30,8 @@ pub(super) struct GetAttrInput {
 #[derive(Clone, Debug)]
 pub(super) struct GetAttrOutput {
     pub(super) kind: FileType,
-    pub(super) attrs: FileAttrs,
+    pub(super) attrs: InodeAttrs,
+    pub(super) len: u64,
 }
 
 /// Internal request for one bounded directory-authority scan.
@@ -48,7 +49,8 @@ struct ReadDirInput {
 pub(crate) struct ReadDirEntry {
     pub(crate) name: String,
     pub(crate) kind: FileType,
-    pub(crate) attrs: FileAttrs,
+    pub(crate) attrs: InodeAttrs,
+    pub(crate) len: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -86,7 +88,8 @@ pub(crate) struct GetStatusArgs {
 /// Required namespace status returned after inode authority validation.
 pub(crate) struct GetStatusOutput {
     pub(crate) kind: FileType,
-    pub(crate) attrs: FileAttrs,
+    pub(crate) attrs: InodeAttrs,
+    pub(crate) len: u64,
 }
 
 /// Validated filesystem arguments for one public directory-listing page.
@@ -160,6 +163,7 @@ impl MetadataFileSystem {
             payload: GetStatusOutput {
                 kind: success.payload.kind,
                 attrs: success.payload.attrs,
+                len: success.payload.len,
             },
             group_name: success.group_name,
             mount_epoch: success.mount_epoch,
@@ -336,13 +340,6 @@ impl MetadataFileSystem {
         }
     }
 
-    fn generation_for_inode(inode: &Inode) -> Option<ContentGeneration> {
-        match &inode.data {
-            InodeData::File { generation, .. } => *generation,
-            _ => None,
-        }
-    }
-
     fn caller_context_fields(req_ctx: &RequestContext) -> Option<CallerContextFields> {
         req_ctx
             .caller
@@ -365,83 +362,19 @@ impl MetadataFileSystem {
     }
 
     fn classify_unavailable_read_location(
-        req: &RequestContext,
-        worker_lookup_group_name: &GroupName,
-        extent: &Extent,
-        block_stamp: u64,
         reported: &[ReportedBlockLocation],
         views: &[WorkerPlacementView],
-    ) -> (ErrorKind, String) {
-        let matching_stamp = reported
-            .iter()
-            .filter(|location| location.block_stamp == block_stamp)
-            .collect::<Vec<_>>();
-        if !reported.is_empty() && matching_stamp.is_empty() {
-            return (
-                ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
-                format!(
-                    "block location unavailable: block stamp mismatch for group={} block={} file_offset={} expected_stamp={} reported_stamps={:?}",
-                    worker_lookup_group_name,
-                    extent.block_id,
-                    extent.file_offset,
-                    block_stamp,
-                    reported.iter().map(|location| location.block_stamp).collect::<Vec<_>>()
-                ),
-            );
-        }
-
-        for location in &matching_stamp {
-            if let Some(view) = views
-                .iter()
-                .find(|view| view.group_name == *worker_lookup_group_name && view.worker_id == location.worker_id)
-            {
-                if view
-                    .worker_run_id
-                    .is_some_and(|worker_run_id| !worker_run_id.matches(location.worker_run_id))
-                {
-                    return (
-                        ErrorKind::Worker(WorkerErrorKind::RunMismatch),
-                        format!(
-                            "block location unavailable: stale worker run for group={} block={} file_offset={} worker={} reported_run={} current_run={:?}",
-                            worker_lookup_group_name,
-                            extent.block_id,
-                            extent.file_offset,
-                            location.worker_id,
-                            location.worker_run_id,
-                            view.worker_run_id
-                        ),
-                    );
-                }
-            }
-        }
-
-        let reason_detail = if reported.is_empty() {
-            "no ready block report"
-        } else if matching_stamp.is_empty() {
-            "no matching block stamp"
+    ) -> ErrorKind {
+        if reported.iter().any(|location| {
+            views.iter().any(|worker| {
+                worker.worker_id == location.worker_id
+                    && worker.worker_run_id.is_some_and(|run| run != location.worker_run_id)
+            })
+        }) {
+            ErrorKind::Worker(WorkerErrorKind::RunMismatch)
         } else {
-            "no usable live replica"
-        };
-        let caller_context = req
-            .caller
-            .caller_context
-            .as_ref()
-            .map(|ctx| ctx.context.as_str())
-            .unwrap_or("-");
-        (
-            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable),
-            format!(
-                "block location unavailable: reason={} group={} block={} file_offset={} block_stamp={} caller_context={} reported_locations={} worker_views={}",
-                reason_detail,
-                worker_lookup_group_name,
-                extent.block_id,
-                extent.file_offset,
-                block_stamp,
-                caller_context,
-                reported.len(),
-                views.len()
-            ),
-        )
+            ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable)
+        }
     }
 
     async fn plan_inode_mount(&self, req_ctx: &RequestContext, inode_id: InodeId) -> FsResult<InodeMountGuardInputs> {
@@ -457,20 +390,20 @@ impl MetadataFileSystem {
             }
             Err(err) => return self.failure_from_error(req_ctx, err, None, None),
         };
-        if inode.inode_id != inode_id || inode.kind != inode.data.kind() {
+        if inode.inode_id != inode_id {
             return self.failure_from_error(
                 req_ctx,
                 MetadataError::Internal(format!(
                     "inode authority is corrupt for GetBlockLocations: key={inode_id}, value_id={}, kind={:?}, payload={:?}",
                     inode.inode_id,
-                    inode.kind,
-                    inode.data.kind()
+                    inode.file_type(),
+                    inode.file_type()
                 )),
                 None,
                 None,
             );
         }
-        if !inode.kind.is_file() {
+        if !inode.file_type().is_file() {
             return self.failure_from_error(
                 req_ctx,
                 MetadataError::IsDir(format!("Inode is not a file: {inode_id}")),
@@ -502,15 +435,15 @@ impl MetadataFileSystem {
                 }
                 Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
             };
-            if inode.inode_id != req.inode_id || inode.kind != inode.data.kind() {
+            if inode.inode_id != req.inode_id {
                 return self.failure_from_error(
                     &req.ctx,
                     MetadataError::Internal(format!(
                         "inode authority is corrupt for GetStatus: key={}, value_id={}, kind={:?}, payload={:?}",
                         req.inode_id,
                         inode.inode_id,
-                        inode.kind,
-                        inode.data.kind()
+                        inode.file_type(),
+                        inode.file_type()
                     )),
                     None,
                     None,
@@ -522,8 +455,9 @@ impl MetadataFileSystem {
                 .await?;
             self.success_with_route_epoch(
                 GetAttrOutput {
-                    kind: inode.kind,
+                    kind: inode.file_type(),
                     attrs: inode.attrs.clone(),
+                    len: inode.len(),
                 },
                 group_name,
                 mount_epoch,
@@ -551,21 +485,21 @@ impl MetadataFileSystem {
                 }
                 Err(err) => return self.failure_from_error(&req.ctx, err, None, None),
             };
-            if parent_inode.inode_id != req.parent_inode_id || parent_inode.kind != parent_inode.data.kind() {
+            if parent_inode.inode_id != req.parent_inode_id {
                 return self.failure_from_error(
                     &req.ctx,
                     MetadataError::Internal(format!(
                         "inode authority is corrupt for ListStatus: key={}, value_id={}, kind={:?}, payload={:?}",
                         req.parent_inode_id,
                         parent_inode.inode_id,
-                        parent_inode.kind,
-                        parent_inode.data.kind()
+                        parent_inode.file_type(),
+                        parent_inode.file_type()
                     )),
                     None,
                     None,
                 );
             }
-            if !parent_inode.kind.is_dir() {
+            if !parent_inode.file_type().is_dir() {
                 return self.failure_from_error(
                     &req.ctx,
                     MetadataError::InvalidArgument(format!("Parent is not a directory: {}", req.parent_inode_id)),
@@ -614,14 +548,14 @@ impl MetadataFileSystem {
                         );
                     }
                 };
-                if child_inode.inode_id != child_inode_id || child_inode.kind != child_inode.data.kind() {
+                if child_inode.inode_id != child_inode_id {
                     return self.failure_from_error_with_route_epoch(
                         &req.ctx,
                         MetadataError::Internal(format!(
                             "child inode authority is corrupt for ListStatus: key={child_inode_id}, value_id={}, kind={:?}, payload={:?}",
                             child_inode.inode_id,
-                            child_inode.kind,
-                            child_inode.data.kind()
+                            child_inode.file_type(),
+                            child_inode.file_type()
                         )),
                         group_name,
                         mount_epoch,
@@ -630,8 +564,8 @@ impl MetadataFileSystem {
                 }
                 dir_entries.push(ReadDirEntry {
                     name,
-                    kind: child_inode.kind,
-                    attrs: child_inode.attrs.clone(),
+                    kind: child_inode.file_type(),
+                    attrs: child_inode.attrs.clone(), len: child_inode.len(),
                 });
             }
 
@@ -669,21 +603,21 @@ impl MetadataFileSystem {
                 }
             };
 
-            if inode.inode_id != req.inode_id || inode.kind != inode.data.kind() {
+            if inode.inode_id != req.inode_id {
                 return self.failure_from_error(
                     &req.ctx,
                     MetadataError::Internal(format!(
                         "inode authority is corrupt for GetFileLayout: key={}, value_id={}, kind={:?}, payload={:?}",
                         req.inode_id,
                         inode.inode_id,
-                        inode.kind,
-                        inode.data.kind()
+                        inode.file_type(),
+                        inode.file_type()
                     )),
                     None,
                     None,
                 );
             }
-            if !inode.kind.is_file() {
+            if !inode.file_type().is_file() {
                 return self.failure_from_error(
                     &req.ctx,
                     MetadataError::IsDir(format!("Inode is not a file: {}", req.inode_id)),
@@ -696,98 +630,33 @@ impl MetadataFileSystem {
                 .validate_read_freshness_for_mount(&req.ctx, req.freshness, inode.mount_id, "GetFileLayout")
                 .await?;
 
-            let generation = Self::generation_for_inode(&inode);
-            let extents = match &inode.data {
-                InodeData::File { extents, .. } => extents.clone(),
-                _ => Vec::new(),
-            };
-            let inode_id = req.inode_id;
-            let layout = match self.read_layout(req.inode_id) {
-                Ok(layout) => layout,
-                Err(err) => {
-                    return self.failure_from_error_with_route_epoch(
-                        &req.ctx,
-                        err,
-                        group_name,
-                        mount_epoch,
-                        route_epoch,
-                    )
-                }
-            };
-            let storage_chunk_size = match layout.block_format_id.spec() {
-                Ok(spec) => spec.storage_chunk_size,
-                Err(error) => {
-                    return self.failure_from_error_with_route_epoch(
-                        &req.ctx,
-                        MetadataError::Internal(format!("persisted file layout has an unknown block format: {error}")),
-                        group_name,
-                        mount_epoch,
-                        route_epoch,
-                    )
-                }
-            };
-            for extent in &extents {
-                if extent.block_id.inode_id != inode_id {
-                    return self.failure_from_error_with_route_epoch(
-                        &req.ctx,
-                        MetadataError::Internal(format!(
-                            "Extent block inode_id {} does not match inode {} inode_id {}",
-                            extent.block_id.inode_id, req.inode_id, inode_id
-                        )),
-                        group_name,
-                        mount_epoch,
-                        route_epoch,
-                    );
-                }
+            let file = inode.file().expect("file kind checked above");
+            if let Err(error) = file.validate(req.inode_id) {
+                return self.failure_from_error_with_route_epoch(&req.ctx, error, group_name, mount_epoch, route_epoch);
             }
-            let filtered_extents: Vec<Extent> = if let Some(range) = req.range {
-                let range_end = match range.offset.checked_add(range.len) {
-                    Some(range_end) => range_end,
+            let layout = file.layout;
+            let storage_chunk_size = layout
+                .block_format_id
+                .spec()
+                .expect("validated layout")
+                .storage_chunk_size;
+            let (range_start, range_end) = match req.range {
+                Some(range) => match range.offset.checked_add(range.len) {
+                    Some(end) => (range.offset, end),
                     None => {
                         return self.failure_from_error_with_route_epoch(
                             &req.ctx,
-                            MetadataError::InvalidArgument(format!(
-                                "range end overflows: offset={}, len={}",
-                                range.offset, range.len
-                            )),
+                            MetadataError::InvalidArgument("range end overflows".into()),
                             group_name,
                             mount_epoch,
                             route_epoch,
-                        );
+                        )
                     }
-                };
-                if range.len == 0 {
-                    Vec::new()
-                } else {
-                    let mut filtered = Vec::with_capacity(extents.len());
-                    for extent in extents {
-                        let extent_end = match extent.file_offset.checked_add(extent.len) {
-                            Some(extent_end) => extent_end,
-                            None => {
-                                return self.failure_from_error_with_route_epoch(
-                                    &req.ctx,
-                                    MetadataError::Internal(format!(
-                                        "extent range overflows: file_offset={}, len={}",
-                                        extent.file_offset, extent.len
-                                    )),
-                                    group_name,
-                                    mount_epoch,
-                                    route_epoch,
-                                );
-                            }
-                        };
-                        if extent.file_offset < range_end && extent_end > range.offset {
-                            filtered.push(extent);
-                        }
-                    }
-                    filtered
-                }
-            } else {
-                extents
+                },
+                None => (0, file.len),
             };
-
             let worker_manager = self.worker_manager.as_ref();
-            let worker_lookup_group_name = if worker_manager.is_some() && !filtered_extents.is_empty() {
+            let worker_group = if worker_manager.is_some() && !file.blocks.is_empty() && range_start < range_end {
                 Some(self.require_worker_lookup_group(
                     &req.ctx,
                     group_name.clone(),
@@ -799,86 +668,40 @@ impl MetadataFileSystem {
                 None
             };
             let caller = Self::caller_context_fields(&req.ctx);
-            let mut locations = Vec::with_capacity(filtered_extents.len());
-            for extent in &filtered_extents {
-                let block_stamp = match extent.block_stamp {
-                    Some(stamp) => {
-                        if stamp == 0 {
-                            return self.failure_from_error_with_route_epoch(
-                                &req.ctx,
-                                MetadataError::InvalidArgument(format!(
-                                    "extent {} at file_offset {} has zero block_stamp",
-                                    extent.block_id, extent.file_offset
-                                )),
-                                group_name,
-                                mount_epoch,
-                                route_epoch,
-                            );
-                        }
-                        stamp
-                    }
-                    None => {
-                        return self.failure_from_error_with_route_epoch(
-                            &req.ctx,
-                            MetadataError::InvalidArgument(format!(
-                                "extent {} at file_offset {} missing block_stamp",
-                                extent.block_id, extent.file_offset
-                            )),
-                            group_name,
-                            mount_epoch,
-                            route_epoch,
-                        );
-                    }
-                };
-                let effective_len = match extent.block_offset.checked_add(extent.len) {
-                    Some(len) => len,
-                    None => {
-                        return self.failure_from_error_with_route_epoch(
-                            &req.ctx,
-                            MetadataError::Internal(format!(
-                                "extent block range overflows: block_offset={}, len={}",
-                                extent.block_offset, extent.len
-                            )),
-                            group_name,
-                            mount_epoch,
-                            route_epoch,
-                        );
-                    }
-                };
+            let mut locations = Vec::new();
+            for (ordinal, block_id) in file.blocks.iter().copied().enumerate() {
+                let file_offset = ordinal as u64 * u64::from(layout.block_size);
+                let effective_len = file.block_len(ordinal);
+                if range_start == range_end || file_offset >= range_end || file_offset + effective_len <= range_start {
+                    continue;
+                }
                 let mut workers = Vec::new();
-                if let (Some(worker_manager), Some(worker_lookup_group_name)) =
-                    (worker_manager, worker_lookup_group_name.as_ref())
-                {
-                    let reported = worker_manager.reported_block_locations(worker_lookup_group_name, extent.block_id);
-                    let views = worker_manager.collect_worker_placement_views(worker_lookup_group_name);
-                    let usable_views: Vec<_> = views.into_iter().filter(Self::has_usable_read_endpoint).collect();
+                if let (Some(manager), Some(worker_group)) = (worker_manager, worker_group.as_ref()) {
+                    let reported = manager.reported_block_locations(worker_group, block_id);
+                    let views: Vec<_> = manager
+                        .collect_worker_placement_views(worker_group)
+                        .into_iter()
+                        .filter(Self::has_usable_read_endpoint)
+                        .collect();
                     let plan = PlacementPlanner.plan(
                         &PlacementRequest {
-                            group_name: worker_lookup_group_name.clone(),
+                            group_name: worker_group.clone(),
                             op: PlacementOp::Read,
-                            block_id: extent.block_id,
-                            block_stamp: Some(block_stamp),
+                            block_id,
+                            visible_len: effective_len,
                             layout,
                             caller: caller.clone(),
                             existing: reported.clone(),
                             exclude_workers: Vec::new(),
                             target_replicas: SUPPORTED_REPLICA_COUNT,
                         },
-                        &usable_views,
+                        &views,
                     );
                     if plan.status == PlacementStatus::NoLiveReplica {
-                        let (kind, message) = Self::classify_unavailable_read_location(
-                            &req.ctx,
-                            worker_lookup_group_name,
-                            extent,
-                            block_stamp,
-                            &reported,
-                            &usable_views,
-                        );
                         return self.refresh_metadata_failure_with_hint(
                             &req.ctx,
-                            kind,
-                            message,
+                            Self::classify_unavailable_read_location(&reported, &views),
+                            format!("no live replica holds the visible prefix of block {block_id}"),
                             group_name,
                             mount_epoch,
                             route_epoch,
@@ -888,7 +711,6 @@ impl MetadataFileSystem {
                             }),
                         );
                     }
-                    workers.reserve(plan.workers.len());
                     for worker in plan.workers {
                         if let Ok(endpoint) = worker_endpoint_from_parts(
                             worker.worker_id,
@@ -901,10 +723,9 @@ impl MetadataFileSystem {
                     }
                 }
                 locations.push(FileBlockLocation {
-                    block_id: extent.block_id,
-                    file_offset: extent.file_offset,
-                    len: extent.len,
-                    block_stamp,
+                    block_id,
+                    file_offset,
+                    len: effective_len,
                     workers,
                     block_format_id: layout.block_format_id,
                     block_size: u64::from(layout.block_size),
@@ -912,10 +733,11 @@ impl MetadataFileSystem {
                     effective_len,
                 });
             }
+            let generation = Some(file.generation);
 
             self.success_with_route_epoch(
                 GetFileLayoutOutput {
-                    file_size: inode.attrs.size,
+                    file_size: inode.len(),
                     generation,
                     locations,
                 },
@@ -945,27 +767,22 @@ fn record_fs_read_result<T>(operation: &str, started: Instant, result: &FsResult
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inode::{Inode, InodeKind};
     use crate::service::filesystem::tests::*;
     use beryl_types::{GroupStateWatermark, RaftLogId, WriteMode};
 
     fn seed_visible_block(storage: &RocksDBStorage, mount_id: MountId, inode_id: InodeId, block_id: BlockId) {
-        let mut attrs = FileAttrs::new();
-        attrs.size = 512;
-        let mut inode = Inode::new_file(inode_id, attrs, mount_id);
-        inode.data = InodeData::File {
-            extents: vec![Extent {
-                file_offset: 0,
-                block_id,
-                block_offset: 0,
-                len: 512,
-                generation: Some(ContentGeneration::new(1)),
-                block_stamp: Some(41),
-            }],
-            generation: Some(ContentGeneration::new(1)),
-            lease_epoch: None,
-            next_block_index: 1,
+        let attrs = InodeAttrs::new();
+        let mut inode = Inode::new_file(inode_id, attrs, mount_id, beryl_types::FileLayout::new(4096));
+        inode.kind = InodeKind::File(crate::inode::FileData {
+            len: 512,
+            layout: FileLayout::new(4096),
+            blocks: vec![block_id],
+            generation: ContentGeneration::new(1),
+            lease_epoch: beryl_types::LeaseEpoch::default(),
+            next_index: 1,
             last_commit: None,
-        };
+        });
         storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
     }
@@ -983,7 +800,12 @@ mod tests {
         storage
             .put_inode_at_storage_key(
                 storage_key_inode_id,
-                &Inode::new_file(stored_inode_id, FileAttrs::new(), mount_id),
+                &Inode::new_file(
+                    stored_inode_id,
+                    InodeAttrs::new(),
+                    mount_id,
+                    beryl_types::FileLayout::new(4096),
+                ),
             )
             .unwrap();
         storage.put_layout(storage_key_inode_id, FileLayout::new(4096)).unwrap();
@@ -1008,14 +830,14 @@ mod tests {
         enum Case {
             MissingReport,
             NonReady,
-            StampMismatch,
+            ShortPrefix,
             ExpiredWorker,
         }
 
         for (offset, case) in [
             (0, Case::MissingReport),
             (1, Case::NonReady),
-            (2, Case::StampMismatch),
+            (2, Case::ShortPrefix),
             (3, Case::ExpiredWorker),
         ] {
             let dir = TempDir::new().unwrap();
@@ -1047,9 +869,9 @@ mod tests {
                     &group_name_value,
                     worker_id,
                     1,
-                    report_block_with_stamp_and_state(block_id, 41, BlockReportBlockState::Corrupt),
+                    report_block_with_epoch_and_state(block_id, 41, BlockReportBlockState::Corrupt),
                 ),
-                Case::StampMismatch => publish_report_locations_with_stamp(
+                Case::ShortPrefix => publish_report_locations_with_epoch(
                     &worker_manager,
                     &group_name_value,
                     worker_id,
@@ -1058,7 +880,7 @@ mod tests {
                     vec![block_id],
                 ),
                 Case::ExpiredWorker => {
-                    publish_report_locations_with_stamp(
+                    publish_report_locations_with_epoch(
                         &worker_manager,
                         &group_name_value,
                         worker_id,
@@ -1093,13 +915,7 @@ mod tests {
                 Err(failure) => failure,
             };
 
-            match case {
-                Case::StampMismatch => {
-                    assert_refresh_metadata(&failure.error, ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch));
-                    assert!(failure.error.message.contains(&block_id.to_string()));
-                }
-                _ => assert_block_location_unavailable(&failure, block_id),
-            }
+            assert_block_location_unavailable(&failure, block_id);
         }
     }
 
@@ -1113,7 +929,7 @@ mod tests {
             .with_storage(Arc::clone(&storage))
             .build();
         storage
-            .put_inode(&Inode::new_dir(parent_inode_id, FileAttrs::new(), mount_id))
+            .put_inode(&Inode::new_dir(parent_inode_id, InodeAttrs::new(), mount_id))
             .unwrap();
 
         let failure = filesystem
@@ -1156,14 +972,9 @@ mod tests {
         let key = open.payload;
         let target = allocate_block_for_key(&env.filesystem, &key).await;
         publish_env_write_target(&env, &target, 1);
-        commit_for_key(
-            &env.filesystem,
-            &key,
-            vec![committed_block(target.block_id, target.file_offset, 64)],
-            64,
-        )
-        .await
-        .expect("commit should succeed");
+        commit_for_key(&env.filesystem, &key, vec![committed_block(target.block_id, 64)], 64)
+            .await
+            .expect("commit should succeed");
 
         let current_state = env
             .filesystem

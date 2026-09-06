@@ -3,6 +3,7 @@
 
 //! gRPC WorkerDataService adapter and server entry point.
 
+use crate::config::WorkerRegistrationConfig;
 use crate::control::RegistrationSet;
 use crate::data::convert::{proto_to_read_block_request, proto_to_write_block_request};
 use crate::data::core::{ActiveBlockRead, ActiveBlockWrite, WorkerCore};
@@ -15,15 +16,18 @@ use beryl_common::header::{
     WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
 };
 use beryl_common::observe::propagation::{extract_trace_context, ExtractedContext};
+use beryl_proto::common::RequestHeaderProto;
 use beryl_proto::common::{ClientInfoProto, ErrorDetailProto, TraceContextProto};
 use beryl_proto::convert::require_worker_run_id;
+use beryl_proto::metadata::file_system_service_proto_client::FileSystemServiceProtoClient;
+use beryl_proto::metadata::AuthorizeBlockWriteRequestProto;
 use beryl_proto::worker::worker_data_service_server::{WorkerDataService, WorkerDataServiceServer};
 use beryl_proto::worker::write_block_request_proto::Payload;
 use beryl_proto::worker::{
     DataRequestHeaderProto, DataResponseHeaderProto, ReadBlockChunkProto, ReadBlockRequestProto,
     WriteBlockRequestProto, WriteBlockResponseProto,
 };
-use beryl_types::GroupName;
+use beryl_types::{CallId, ClientId, GroupName};
 use bytes::Bytes;
 use futures::{stream, Stream, StreamExt};
 use prost::Message;
@@ -33,6 +37,7 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::service::Routes;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Response, Status, Streaming};
 use tracing::Span;
 
@@ -43,6 +48,8 @@ pub struct WorkerDataServiceImpl {
     registration_state: Arc<RegistrationSet>,
     read_slots: Arc<Semaphore>,
     write_slots: Arc<Semaphore>,
+    metadata: FileSystemServiceProtoClient<Channel>,
+    control_client_id: ClientId,
 }
 
 impl WorkerDataServiceImpl {
@@ -52,13 +59,75 @@ impl WorkerDataServiceImpl {
         registration_state: Arc<RegistrationSet>,
         max_concurrent_reads: usize,
         max_concurrent_writes: usize,
-    ) -> Self {
-        Self {
+        metadata: &WorkerRegistrationConfig,
+    ) -> Result<Self, WorkerError> {
+        metadata
+            .validate()
+            .map_err(|e| WorkerError::InvalidArgument(e.message))?;
+        let timeout = std::time::Duration::from_millis(metadata.request_timeout_ms);
+        let channel = Endpoint::from_shared(metadata.endpoints[0].clone())
+            .map_err(|e| WorkerError::InvalidArgument(e.to_string()))?
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            .connect_lazy();
+        Ok(Self {
             core,
             registration_state,
             read_slots: Arc::new(Semaphore::new(max_concurrent_reads)),
             write_slots: Arc::new(Semaphore::new(max_concurrent_writes)),
+            metadata: FileSystemServiceProtoClient::new(channel),
+            control_client_id: ClientId::generate(),
+        })
+    }
+
+    /// Checks the live session before local IO; transport failure cannot grant authority.
+    async fn authorize_write(&self, req: &crate::data::core::WriteBlockRequest) -> Result<u64, WorkerError> {
+        let registration = self
+            .registration_state
+            .registration_for_group(&req.group_name)
+            .ok_or_else(|| WorkerError::Unavailable("Worker registration is unavailable".into()))?;
+        let header = RequestHeaderProto {
+            client: Some(ClientInfoProto {
+                call_id: CallId::new().to_string(),
+                client_id: Some(self.control_client_id.into()),
+                client_name: "worker-write-authorization".into(),
+            }),
+            group_name: req.group_name.to_string(),
+            ..Default::default()
+        };
+        let response = self
+            .metadata
+            .clone()
+            .authorize_block_write(AuthorizeBlockWriteRequestProto {
+                header: Some(header),
+                group_name: req.group_name.to_string(),
+                worker_id: registration.worker_id.as_raw(),
+                worker_run_id: req.worker_run_id.to_string(),
+                fencing_token: Some(req.fencing_token.into()),
+                write_offset: req.write_offset,
+                block_size: req.block_size,
+                block_format_id: req.block_format_id.as_raw(),
+                chunk_size: req.chunk_size,
+                tier: beryl_proto::common::TierProto::from(req.tier) as i32,
+            })
+            .await
+            .map_err(|e| WorkerError::Unavailable(format!("Metadata write authorization failed: {e}")))?
+            .into_inner();
+        let header = response
+            .header
+            .ok_or_else(|| WorkerError::Corrupt("write authorization response has no header".into()))?;
+        if let Some(error) = header.error {
+            return Err(WorkerError::RefreshMetadata {
+                kind: ErrorKind::Worker(WorkerErrorKind::Fencing),
+                message: error.message,
+            });
         }
+        if header.group_name != req.group_name.as_str() || response.visible_len > req.write_offset {
+            return Err(WorkerError::Corrupt(
+                "write authorization response has inconsistent scope".into(),
+            ));
+        }
+        Ok(response.visible_len)
     }
 
     /// Acquires one read slot without queuing so write saturation cannot block reads.
@@ -71,7 +140,7 @@ impl WorkerDataServiceImpl {
         Self::acquire_data_rpc(Arc::clone(&self.write_slots), "write")
     }
 
-    /// Rejects one mode before Worker staging or read IO begins when its pool is full.
+    /// Rejects one mode before Worker write IO or read IO begins when its pool is full.
     fn acquire_data_rpc(slots: Arc<Semaphore>, mode: &'static str) -> Result<DataRpcPermit, Status> {
         match slots.try_acquire_owned() {
             Ok(permit) => Ok(DataRpcPermit::new(permit, mode)),
@@ -156,7 +225,7 @@ impl WorkerDataServiceImpl {
     }
 
     /// Consumes the command before returning the response stream, making the
-    /// first empty response an exact acknowledgement of staging creation.
+    /// first empty response an exact acknowledgement of block-open checkpoint.
     async fn begin_write_block<S>(
         &self,
         mut requests: S,
@@ -216,12 +285,24 @@ impl WorkerDataServiceImpl {
             observe::record_data_rpc("write_block", "error", error_kind, started.elapsed().as_secs_f64());
             Self::data_error_status(header.clone(), error)
         })?;
-        let write = self.core.begin_block_write(domain, rpc_permit).await.map_err(|error| {
-            let error_kind = observe::worker_error_kind(&error);
-            observe::record_stream_open("write", "error", error_kind);
-            observe::record_data_rpc("write_block", "error", error_kind, started.elapsed().as_secs_f64());
-            Self::data_error_status(header.clone(), error)
-        })?;
+        let block_pin = self
+            .core
+            .pin_write_authorization(&domain)
+            .map_err(|error| Self::data_error_status(header.clone(), error))?;
+        let visible_len = self
+            .authorize_write(&domain)
+            .await
+            .map_err(|error| Self::data_error_status(header.clone(), error))?;
+        let write = self
+            .core
+            .begin_block_write(domain, rpc_permit, block_pin, visible_len)
+            .await
+            .map_err(|error| {
+                let error_kind = observe::worker_error_kind(&error);
+                observe::record_stream_open("write", "error", error_kind);
+                observe::record_data_rpc("write_block", "error", error_kind, started.elapsed().as_secs_f64());
+                Self::data_error_status(header.clone(), error)
+            })?;
         observe::record_stream_open("write", "ok", "none");
         Ok(WriteBlockState {
             core: Arc::clone(&self.core),
@@ -309,7 +390,18 @@ where
         }
 
         loop {
-            match self.requests.next().await {
+            let next = tokio::select! {
+                biased;
+                _ = self.write.as_ref().expect("active write").retired() => {
+                    Err(WorkerError::Cancelled("block writer authority was revoked".into()))
+                }
+                next = self.requests.next() => Ok(next),
+            };
+            let next = match next {
+                Ok(next) => next,
+                Err(error) => return Some(self.fail(error).await),
+            };
+            match next {
                 Some(Ok(request)) => match request.payload {
                     Some(Payload::Data(data)) => {
                         let len = data.len() as u64;
@@ -514,20 +606,25 @@ pub fn worker_data_routes(
     registration_state: Arc<RegistrationSet>,
     max_concurrent_reads: usize,
     max_concurrent_writes: usize,
-) -> Routes {
-    let service = WorkerDataServiceImpl::new(core, registration_state, max_concurrent_reads, max_concurrent_writes);
-    Routes::new(
+    metadata: &WorkerRegistrationConfig,
+) -> Result<Routes, WorkerError> {
+    let service = WorkerDataServiceImpl::new(
+        core,
+        registration_state,
+        max_concurrent_reads,
+        max_concurrent_writes,
+        metadata,
+    )?;
+    Ok(Routes::new(
         WorkerDataServiceServer::new(service)
             .max_decoding_message_size(beryl_proto::MAX_WORKER_DATA_MESSAGE_SIZE)
             .max_encoding_message_size(beryl_proto::MAX_WORKER_DATA_MESSAGE_SIZE),
-    )
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        WorkerDataServiceImpl, HEADER_WORKER_DATA_REJECTION, WORKER_DATA_REJECTION_CAPACITY_BEFORE_SIDE_EFFECT,
-    };
+    use super::*;
     use crate::control::{Registration, RegistrationSet};
     use crate::data::core::WorkerCore;
     use crate::store::block::{BlockState, FullBlockFileStore, FullBlockFileStoreConfig};
@@ -573,7 +670,7 @@ mod tests {
         (
             temp,
             store,
-            WorkerDataServiceImpl::new(core, registrations, 1, 1),
+            WorkerDataServiceImpl::new(core, registrations, 1, 1, &WorkerRegistrationConfig::default()).unwrap(),
             worker_run_id,
         )
     }
@@ -588,17 +685,51 @@ mod tests {
                     block_index: 3,
                 }),
                 worker_run_id: worker_run_id.to_string(),
-                block_format_id: BlockFormatId::FULL_EFFECTIVE.as_raw(),
+                block_format_id: BlockFormatId::DURABLE_PREFIX.as_raw(),
                 block_size: 4096,
-                chunk_size: BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size,
-                block_stamp: 55,
+                chunk_size: BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size,
+                fencing_token: Some(
+                    beryl_types::FencingToken::new(block_id(), ClientId::new(9), beryl_types::LeaseEpoch::new(55))
+                        .into(),
+                ),
+                write_offset: 0,
                 tier: TierProto::TierHdd as i32,
             }))),
         }
     }
 
+    impl WorkerDataServiceImpl {
+        // Protocol tests start after online authorization; real RPC authorization is covered by e2e.
+        async fn begin_authorized_test_write<S>(
+            &self,
+            mut requests: S,
+            permit: DataRpcPermit,
+            _context: &ExtractedContext,
+            started: Instant,
+        ) -> Result<WriteBlockState<S>, Status>
+        where
+            S: Stream<Item = Result<WriteBlockRequestProto, Status>> + Unpin,
+        {
+            let Some(Payload::Command(command)) = requests.next().await.unwrap()?.payload else {
+                panic!("test requires a command")
+            };
+            let req = proto_to_write_block_request(*command).unwrap();
+            let pin = self.core.pin_write_authorization(&req).unwrap();
+            let write = self.core.begin_block_write(req, permit, pin, 0).await.unwrap();
+            Ok(WriteBlockState {
+                core: self.core.clone(),
+                requests,
+                write: Some(write),
+                request_header: None,
+                started,
+                acknowledgement_pending: true,
+                outcome: StreamOutcome::Active,
+            })
+        }
+    }
+
     #[tokio::test]
-    async fn write_block_acknowledges_staging_then_publishes_on_request_eof() {
+    async fn write_block_acknowledges_open_then_checkpoints_on_request_eof() {
         let (_temp, store, service, worker_run_id) = registered_service();
         let requests = stream::iter(vec![
             Ok(command(worker_run_id)),
@@ -612,7 +743,7 @@ mod tests {
         let context = extract_trace_context(&MetadataMap::new());
         let rpc_permit = service.acquire_write_rpc().expect("write capacity");
         let state = service
-            .begin_write_block(requests, rpc_permit, &context, Instant::now())
+            .begin_authorized_test_write(requests, rpc_permit, &context, Instant::now())
             .await
             .expect("begin write");
         let (ack, state) = state.next().await.expect("acknowledgement");
@@ -621,17 +752,17 @@ mod tests {
 
         let meta = store.load_meta(&group_name(), block_id()).expect("ready meta");
         assert_eq!(meta.visibility.block_state, BlockState::Ready);
-        assert_eq!(meta.source.effective_len, 6);
+        assert_eq!(meta.source.durable_len, 6);
     }
 
     #[tokio::test]
-    async fn cancellation_after_ack_releases_staging_through_owned_cleanup() {
+    async fn cancellation_after_ack_releases_write_through_owned_cleanup() {
         let (_temp, _store, service, worker_run_id) = registered_service();
         let requests = stream::iter(vec![Ok(command(worker_run_id))]);
         let context = extract_trace_context(&MetadataMap::new());
         let rpc_permit = service.acquire_write_rpc().expect("write capacity");
         let state = service
-            .begin_write_block(requests, rpc_permit, &context, Instant::now())
+            .begin_authorized_test_write(requests, rpc_permit, &context, Instant::now())
             .await
             .expect("begin write");
         let (_ack, state) = state.next().await.expect("acknowledgement");
@@ -646,7 +777,7 @@ mod tests {
         let replacement = stream::iter(vec![Ok(command(worker_run_id))]);
         let rpc_permit = service.acquire_write_rpc().expect("released write capacity");
         let state = service
-            .begin_write_block(replacement, rpc_permit, &context, Instant::now())
+            .begin_authorized_test_write(replacement, rpc_permit, &context, Instant::now())
             .await
             .expect("replacement write");
         let (_ack, state) = state.next().await.expect("replacement acknowledgement");
@@ -654,13 +785,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_command_fails_and_cleans_the_owned_staging_block() {
+    async fn a_second_command_fails_and_cleans_the_owned_block_write() {
         let (_temp, _store, service, worker_run_id) = registered_service();
         let requests = stream::iter(vec![Ok(command(worker_run_id)), Ok(command(worker_run_id))]);
         let context = extract_trace_context(&MetadataMap::new());
         let rpc_permit = service.acquire_write_rpc().expect("write capacity");
         let state = service
-            .begin_write_block(requests, rpc_permit, &context, Instant::now())
+            .begin_authorized_test_write(requests, rpc_permit, &context, Instant::now())
             .await
             .expect("begin write");
         let (_ack, state) = state.next().await.expect("acknowledgement");
@@ -671,8 +802,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_and_write_capacity_are_independent() {
+    #[tokio::test]
+    async fn read_and_write_capacity_are_independent() {
         let (_temp, _store, service, _worker_run_id) = registered_service();
         let read = service.acquire_read_rpc().expect("read capacity");
         let write = service.acquire_write_rpc().expect("write capacity");
@@ -694,5 +825,49 @@ mod tests {
         service.acquire_read_rpc().expect("read capacity released");
         assert_capacity_rejection(service.acquire_write_rpc().expect_err("write remains full"));
         drop(write);
+    }
+    #[tokio::test]
+    async fn reclaim_revokes_idle_stream_and_releases_its_pin_without_another_frame() {
+        let (_temp, store, service, run) = registered_service();
+        let requests = stream::iter(vec![Ok(command(run))]).chain(stream::pending());
+        let state = service
+            .begin_authorized_test_write(
+                requests,
+                service.acquire_write_rpc().unwrap(),
+                &extract_trace_context(&MetadataMap::new()),
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        let (_, state) = state.next().await.unwrap();
+        let idle = state.next();
+        tokio::pin!(idle);
+        assert!(futures::poll!(&mut idle).is_pending());
+        let reclaim = service.core.reclaim_block(crate::store::block::ReclaimBlockRequest {
+            group_name: group_name(),
+            block_id: block_id(),
+        });
+        tokio::pin!(reclaim);
+        assert!(futures::poll!(&mut reclaim).is_pending());
+        let (error, state) = tokio::time::timeout(Duration::from_secs(1), idle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(error.unwrap_err().code(), Code::Cancelled);
+        assert!(state.write.is_none());
+        assert!(
+            !service
+                .core
+                .drain_block_writes_until(TokioInstant::now() + Duration::from_secs(1))
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(1), reclaim)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!store.paths(&group_name(), block_id()).data_path.exists());
+        service
+            .acquire_write_rpc()
+            .expect("retired stream releases its RPC slot");
     }
 }

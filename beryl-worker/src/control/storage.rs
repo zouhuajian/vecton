@@ -18,7 +18,7 @@ use super::identity::{resolve_existing_worker_id, resolve_worker_id};
 
 const WORKER_STORAGE_INFO_FILE: &str = "worker.storage.json";
 const WORKER_STORAGE_INFO_TEMP_SUFFIX: &str = ".tmp";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
