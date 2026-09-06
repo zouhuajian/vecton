@@ -23,17 +23,11 @@ struct BlockAccessKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockAccessState {
-    Available {
-        pins: usize,
-    },
-    Reclaiming {
-        pins: usize,
-        operation_active: bool,
-        block_stamp: u64,
-    },
+    Available { pins: usize },
+    Reclaiming { pins: usize, operation_active: bool },
 }
 
-/// Coordinates reader pins and destructive block lifecycle transitions.
+/// Coordinates access pins and destructive block lifecycle transitions.
 ///
 /// `changed` wakes lifecycle waiters. `block_report_changes` retains the exact
 /// identities whose reportable state changed before any notification is lost.
@@ -44,11 +38,10 @@ struct BlockAccessRegistry {
     block_report_changes: BlockReportChangeTracker,
 }
 
-/// Exact block version currently excluded from new readers for reclamation.
+/// Exact block currently excluded from new access for reclamation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReclaimingBlock {
     pub block_id: BlockId,
-    pub block_stamp: u64,
 }
 
 /// RAII guard that keeps a Ready block available for one complete read RPC.
@@ -57,19 +50,34 @@ pub(crate) struct ReclaimingBlock {
 /// between validation and response-stream ownership. A blocking read clones the
 /// guard so cancellation cannot release reclamation before filesystem IO exits.
 #[derive(Clone, Debug)]
-pub(crate) struct ReadPin {
-    _inner: Arc<ReadPinInner>,
+pub(crate) struct BlockPin {
+    _inner: Arc<BlockPinInner>,
+}
+
+impl BlockPin {
+    /// Checked after write registration to close the pending-authorization/reclaim race.
+    pub(crate) fn is_reclaiming(&self) -> bool {
+        matches!(
+            self._inner
+                .registry
+                .states
+                .lock()
+                .expect("block access state poisoned")
+                .get(&self._inner.key),
+            Some(BlockAccessState::Reclaiming { .. })
+        )
+    }
 }
 
 #[derive(Debug)]
-struct ReadPinInner {
+struct BlockPinInner {
     registry: Arc<BlockAccessRegistry>,
     key: BlockAccessKey,
 }
 
-impl Drop for ReadPinInner {
+impl Drop for BlockPinInner {
     fn drop(&mut self) {
-        self.registry.release_read(&self.key);
+        self.registry.release_pin(&self.key);
     }
 }
 
@@ -85,6 +93,29 @@ pub(crate) struct ReclaimPermit {
 }
 
 impl ReclaimPermit {
+    /// Waits after new admission is closed and existing writers have been retired.
+    pub(crate) async fn wait_for_pins(&self) {
+        loop {
+            let notified = self.registry.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let pins = match self
+                .registry
+                .states
+                .lock()
+                .expect("block access state poisoned")
+                .get(&self.key)
+            {
+                Some(BlockAccessState::Reclaiming { pins, .. }) => *pins,
+                _ => 0,
+            };
+            if pins == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Completes reclamation and removes the transient lifecycle entry.
     ///
     /// Removing the entry also wakes block reporting after `Reclaiming` can no
@@ -105,7 +136,7 @@ impl Drop for ReclaimPermit {
 
 impl BlockAccessRegistry {
     /// Atomically pins an available block or rejects a read after reclaim starts.
-    fn pin_read(self: &Arc<Self>, key: BlockAccessKey) -> WorkerCoreResult<ReadPin> {
+    fn pin_block(self: &Arc<Self>, key: BlockAccessKey) -> WorkerCoreResult<BlockPin> {
         let mut states = self.states.lock().expect("block access state poisoned");
         match states.get_mut(&key) {
             Some(BlockAccessState::Available { pins }) => {
@@ -125,8 +156,8 @@ impl BlockAccessRegistry {
             }
         }
         drop(states);
-        Ok(ReadPin {
-            _inner: Arc::new(ReadPinInner {
+        Ok(BlockPin {
+            _inner: Arc::new(BlockPinInner {
                 registry: Arc::clone(self),
                 key,
             }),
@@ -134,11 +165,7 @@ impl BlockAccessRegistry {
     }
 
     /// Starts or resumes reclamation and waits for all previously pinned readers.
-    async fn begin_reclaim(
-        self: &Arc<Self>,
-        key: BlockAccessKey,
-        expected_block_stamp: u64,
-    ) -> WorkerCoreResult<ReclaimPermit> {
+    fn begin_reclaim(self: &Arc<Self>, key: BlockAccessKey) -> WorkerCoreResult<ReclaimPermit> {
         {
             let mut states = self.states.lock().expect("block access state poisoned");
             match states.get_mut(&key) {
@@ -149,43 +176,17 @@ impl BlockAccessRegistry {
                         BlockAccessState::Reclaiming {
                             pins,
                             operation_active: true,
-                            block_stamp: expected_block_stamp,
                         },
                     );
                 }
                 Some(BlockAccessState::Reclaiming {
-                    operation_active: true,
-                    block_stamp,
-                    ..
+                    operation_active: true, ..
                 }) => {
-                    if *block_stamp != expected_block_stamp {
-                        return Err(WorkerError::RefreshMetadata {
-                            kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
-                            message: format!(
-                                "local block reclamation already targets a different stamp: group_name={}, block_id={}, requested={}, active={}",
-                                key.group_name, key.block_id, expected_block_stamp, block_stamp
-                            ),
-                        });
-                    }
-                    return Err(WorkerError::Unavailable(format!(
-                        "local block reclamation is already running: group_name={}, block_id={}",
-                        key.group_name, key.block_id
-                    )));
+                    return Err(WorkerError::Unavailable(
+                        "local block reclamation is already running".into(),
+                    ));
                 }
-                Some(BlockAccessState::Reclaiming {
-                    operation_active,
-                    block_stamp,
-                    ..
-                }) => {
-                    if *block_stamp != expected_block_stamp {
-                        return Err(WorkerError::RefreshMetadata {
-                            kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
-                            message: format!(
-                                "local block reclamation is fenced by a different stamp: group_name={}, block_id={}, requested={}, reclaiming={}",
-                                key.group_name, key.block_id, expected_block_stamp, block_stamp
-                            ),
-                        });
-                    }
+                Some(BlockAccessState::Reclaiming { operation_active, .. }) => {
                     *operation_active = true;
                 }
                 None => {
@@ -194,7 +195,6 @@ impl BlockAccessRegistry {
                         BlockAccessState::Reclaiming {
                             pins: 0,
                             operation_active: true,
-                            block_stamp: expected_block_stamp,
                         },
                     );
                 }
@@ -207,23 +207,10 @@ impl BlockAccessRegistry {
             key,
             completed: false,
         };
-        loop {
-            let notified = self.changed.notified();
-            let pins = {
-                let states = self.states.lock().expect("block access state poisoned");
-                match states.get(&permit.key) {
-                    Some(BlockAccessState::Reclaiming { pins, .. }) => *pins,
-                    _ => 0,
-                }
-            };
-            if pins == 0 {
-                return Ok(permit);
-            }
-            notified.await;
-        }
+        Ok(permit)
     }
 
-    fn release_read(&self, key: &BlockAccessKey) {
+    fn release_pin(&self, key: &BlockAccessKey) {
         let mut states = self.states.lock().expect("block access state poisoned");
         let mut remove = false;
         if let Some(state) = states.get_mut(key) {
@@ -261,7 +248,7 @@ impl BlockAccessRegistry {
                 states.remove(key);
             }
             Some(BlockAccessState::Reclaiming { pins, .. }) => {
-                panic!("completed block reclamation with {pins} active read pins");
+                panic!("completed block reclamation with {pins} active access pins");
             }
             _ => {}
         }
@@ -270,17 +257,14 @@ impl BlockAccessRegistry {
         self.block_report_changes.record(&key.group_name, key.block_id);
     }
 
-    /// Snapshots exact versions currently fenced from new readers for reporting.
+    /// Snapshots exact identities currently fenced from new access for reporting.
     fn reclaiming_blocks(&self, group_name: &GroupName) -> Vec<ReclaimingBlock> {
         let states = self.states.lock().expect("block access state poisoned");
         let mut blocks = states
             .iter()
             .filter_map(|(key, state)| match state {
-                BlockAccessState::Reclaiming { block_stamp, .. } if &key.group_name == group_name => {
-                    Some(ReclaimingBlock {
-                        block_id: key.block_id,
-                        block_stamp: *block_stamp,
-                    })
+                BlockAccessState::Reclaiming { .. } if &key.group_name == group_name => {
+                    Some(ReclaimingBlock { block_id: key.block_id })
                 }
                 _ => None,
             })
@@ -296,10 +280,7 @@ impl BlockAccessRegistry {
             group_name: group_name.clone(),
             block_id,
         }) {
-            Some(BlockAccessState::Reclaiming { block_stamp, .. }) => Some(ReclaimingBlock {
-                block_id,
-                block_stamp: *block_stamp,
-            }),
+            Some(BlockAccessState::Reclaiming { .. }) => Some(ReclaimingBlock { block_id }),
             _ => None,
         }
     }
@@ -317,7 +298,7 @@ impl BlockAccessRegistry {
 
 /// Block-level facade for open and commit decisions.
 ///
-/// The manager owns block metadata checks, stamp validation, range validation,
+/// The manager owns block metadata checks, range validation,
 /// fencing decisions, and reader-versus-reclaimer lifecycle coordination. It
 /// does not perform block data reads or writes.
 #[derive(Clone, Debug)]
@@ -354,32 +335,22 @@ impl BlockManager {
     }
 
     /// Pins a block before read validation and holds it through the `ReadBlock` response lifetime.
-    pub(crate) fn pin_read(&self, group_name: &GroupName, block_id: BlockId) -> WorkerCoreResult<ReadPin> {
-        self.access.pin_read(BlockAccessKey {
+    pub(crate) fn pin_block(&self, group_name: &GroupName, block_id: BlockId) -> WorkerCoreResult<BlockPin> {
+        self.access.pin_block(BlockAccessKey {
             group_name: group_name.clone(),
             block_id,
         })
     }
 
-    /// Prevents new readers and waits for existing `ReadBlock` pins before cleanup.
-    pub(crate) async fn begin_reclaim(
-        &self,
-        group_name: &GroupName,
-        block_id: BlockId,
-        expected_block_stamp: u64,
-    ) -> WorkerCoreResult<ReclaimPermit> {
-        self.access
-            .begin_reclaim(
-                BlockAccessKey {
-                    group_name: group_name.clone(),
-                    block_id,
-                },
-                expected_block_stamp,
-            )
-            .await
+    /// Prevents new access and waits for existing `ReadBlock` pins before cleanup.
+    pub(crate) fn begin_reclaim(&self, group_name: &GroupName, block_id: BlockId) -> WorkerCoreResult<ReclaimPermit> {
+        self.access.begin_reclaim(BlockAccessKey {
+            group_name: group_name.clone(),
+            block_id,
+        })
     }
 
-    /// Lists exact block versions currently fenced from new readers.
+    /// Lists exact block versions currently fenced from new access.
     pub(crate) fn reclaiming_blocks(&self, group_name: &GroupName) -> Vec<ReclaimingBlock> {
         self.access.reclaiming_blocks(group_name)
     }
@@ -425,19 +396,11 @@ impl BlockManager {
                 ),
             ));
         }
-        if req.block_stamp != meta.visibility.block_stamp {
-            return Err(Self::refresh_metadata(
-                ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
-                format!(
-                    "block stamp mismatch: group_name={}, block_id={}, requested={}, local={}",
-                    req.group_name, req.block_id, req.block_stamp, meta.visibility.block_stamp
-                ),
-            ));
-        }
+
         if req.block_format_id != meta.format.format_id
             || req.block_size != meta.format.block_size
             || u64::from(req.chunk_size) != meta.format.chunk_size
-            || req.effective_len != meta.source.effective_len
+            || req.effective_len > meta.source.durable_len
         {
             return Err(Self::refresh_metadata(
                 ErrorKind::Metadata(MetadataErrorKind::StaleState),
@@ -452,7 +415,7 @@ impl BlockManager {
                     req.chunk_size,
                     meta.format.chunk_size,
                     req.effective_len,
-                    meta.source.effective_len
+                    meta.source.durable_len
                 ),
             ));
         }
@@ -462,10 +425,10 @@ impl BlockManager {
             .offset
             .checked_add(u64::from(req.byte_range.len))
             .ok_or_else(|| WorkerError::InvalidArgument("byte range offset overflow".to_string()))?;
-        if req.byte_range.offset > meta.source.effective_len || range_end > meta.source.effective_len {
+        if req.byte_range.offset > meta.source.durable_len || range_end > meta.source.durable_len {
             return Err(WorkerError::InvalidArgument(format!(
                 "byte range exceeds effective block length: group_name={}, block_id={}, offset={}, len={}, effective_len={}",
-                req.group_name, req.block_id, req.byte_range.offset, req.byte_range.len, meta.source.effective_len
+                req.group_name, req.block_id, req.byte_range.offset, req.byte_range.len, meta.source.durable_len
             )));
         }
 
@@ -474,11 +437,6 @@ impl BlockManager {
 
     /// Rejects malformed or internally inconsistent read authority before pinning.
     pub(crate) fn validate_read_request(&self, req: &ReadBlockRequest) -> WorkerCoreResult<()> {
-        if req.block_stamp == 0 {
-            return Err(WorkerError::InvalidArgument(
-                "block_stamp must be metadata-assigned and non-zero".to_string(),
-            ));
-        }
         BlockShape::new(req.block_format_id, req.block_size, req.chunk_size, req.effective_len)
             .map_err(|err| WorkerError::InvalidArgument(err.to_string()))?;
 
@@ -510,77 +468,31 @@ impl Default for BlockManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::ids::{BlockId, BlockIndex, InodeId};
+    use beryl_types::{BlockIndex, InodeId};
     use std::time::Duration;
 
-    fn group_name() -> GroupName {
-        GroupName::parse("root").expect("valid test group")
-    }
-
-    fn block_id() -> BlockId {
-        BlockId::new(InodeId::new(7), BlockIndex::new(3))
-    }
-
     #[tokio::test]
-    async fn reclaim_waits_for_existing_pin_and_rejects_new_readers() {
+    async fn reclaim_drains_shared_io_pins_and_failure_keeps_admission_closed() {
         let manager = BlockManager::default();
-        let pin = manager.pin_read(&group_name(), block_id()).expect("initial pin");
-        let in_progress_read = pin.clone();
+        let group = GroupName::parse("root").unwrap();
+        let id = BlockId::new(InodeId::new(7), BlockIndex::new(3));
+        let pin = manager.pin_block(&group, id).unwrap();
+        let io_pin = pin.clone();
+        let permit = manager.begin_reclaim(&group, id).unwrap();
+        assert!(pin.is_reclaiming());
+        assert!(manager.pin_block(&group, id).is_err());
+        assert!(manager.begin_reclaim(&group, id).is_err());
         drop(pin);
-        let reclaim_manager = manager.clone();
-        let reclaim = tokio::spawn(async move {
-            reclaim_manager
-                .begin_reclaim(&group_name(), block_id(), 41)
-                .await
-                .expect("reclaim permit")
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                match manager.pin_read(&group_name(), block_id()) {
-                    Err(WorkerError::RefreshMetadata { .. }) => break,
-                    Ok(extra_pin) => drop(extra_pin),
-                    Err(other) => panic!("unexpected read pin error: {other:?}"),
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("reclaim should become visible");
-        assert!(!reclaim.is_finished(), "reclaim must wait for the first read pin");
-
-        drop(in_progress_read);
-        let permit = tokio::time::timeout(Duration::from_secs(1), reclaim)
+        assert!(tokio::time::timeout(Duration::from_millis(20), permit.wait_for_pins())
             .await
-            .expect("reclaim should drain")
-            .expect("reclaim task");
-        assert!(matches!(
-            manager.pin_read(&group_name(), block_id()),
-            Err(WorkerError::RefreshMetadata { .. })
-        ));
-
-        permit.complete();
-        drop(manager.pin_read(&group_name(), block_id()).expect("pin after reclaim"));
-    }
-
-    #[tokio::test]
-    async fn failed_reclaim_remains_fenced_and_can_resume() {
-        let manager = BlockManager::default();
-        let permit = manager
-            .begin_reclaim(&group_name(), block_id(), 41)
-            .await
-            .expect("first reclaim permit");
-        drop(permit);
-
-        assert!(matches!(
-            manager.pin_read(&group_name(), block_id()),
-            Err(WorkerError::RefreshMetadata { .. })
-        ));
-        manager
-            .begin_reclaim(&group_name(), block_id(), 41)
-            .await
-            .expect("resumed reclaim permit")
-            .complete();
-        drop(manager.pin_read(&group_name(), block_id()).expect("pin after retry"));
+            .is_err());
+        drop(io_pin);
+        permit.wait_for_pins().await;
+        drop(permit); // A cancelled destructive operation retains exclusion.
+        assert!(manager.pin_block(&group, id).is_err());
+        let retry = manager.begin_reclaim(&group, id).unwrap();
+        retry.wait_for_pins().await;
+        retry.complete();
+        assert!(manager.pin_block(&group, id).is_ok());
     }
 }

@@ -24,22 +24,23 @@ message BlockIdentityProto {
 message BlockFormatProto {
   uint32 format_id = 1;
   // Full logical block size from the persisted FileLayout. Tail or bounded
-  // valid length is stored in BlockSource.effective_len.
+  // valid length is stored in BlockSource.durable_len.
   uint64 block_size = 2;
   uint32 chunk_size = 3;
 }
 
 message BlockSourceProto {
-  uint64 effective_len = 1;
+  uint64 durable_len = 1;
 }
 
 message BlockVisibilityProto {
   BlockStateProto block_state = 1;
-  uint64 block_stamp = 2;
+  common.FencingTokenProto fencing_token = 2;
 }
 
 enum BlockStateProto {
   BLOCK_STATE_UNSPECIFIED = 0;
   BLOCK_STATE_READY = 1;
   BLOCK_STATE_CORRUPT = 2;
+  BLOCK_STATE_DELETING = 3;
 }

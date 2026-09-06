@@ -11,8 +11,8 @@ use thiserror::Error;
 /// migration for blocks created under the previous ceiling.
 pub const MAX_BLOCK_SIZE: u32 = 1024 * 1024 * 1024;
 
-/// Storage integrity unit fixed by the `FULL_EFFECTIVE` block format.
-const FULL_EFFECTIVE_STORAGE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+/// Storage integrity unit fixed by the `DURABLE_PREFIX` block format.
+const DURABLE_PREFIX_STORAGE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 
 /// Stable parameters selected by one block format identifier.
 ///
@@ -35,11 +35,11 @@ pub struct BlockFormatSpec {
 pub struct BlockFormatId(u32);
 
 impl BlockFormatId {
-    /// Complete effective block file format used by the current worker store.
-    pub const FULL_EFFECTIVE: Self = Self(1);
+    /// Durable-prefix block format with persisted writer fencing and atomic checkpoints.
+    pub const DURABLE_PREFIX: Self = Self(2);
 
     /// Block format metadata assigns to newly created files.
-    pub const CURRENT_FOR_NEW_FILE: Self = Self::FULL_EFFECTIVE;
+    pub const CURRENT_FOR_NEW_FILE: Self = Self::DURABLE_PREFIX;
 
     /// Return the raw format identifier.
     #[inline]
@@ -50,7 +50,7 @@ impl BlockFormatId {
     /// Decode a persisted or wire block format identifier.
     pub fn from_raw(value: u32) -> Result<Self, BlockFormatIdError> {
         match value {
-            1 => Ok(Self::FULL_EFFECTIVE),
+            2 => Ok(Self::DURABLE_PREFIX),
             other => Err(BlockFormatIdError { raw: other }),
         }
     }
@@ -59,8 +59,8 @@ impl BlockFormatId {
     pub fn spec(self) -> Result<BlockFormatSpec, BlockFormatIdError> {
         Self::from_raw(self.as_raw())?;
         Ok(match self {
-            Self::FULL_EFFECTIVE => BlockFormatSpec {
-                storage_chunk_size: FULL_EFFECTIVE_STORAGE_CHUNK_SIZE,
+            Self::DURABLE_PREFIX => BlockFormatSpec {
+                storage_chunk_size: DURABLE_PREFIX_STORAGE_CHUNK_SIZE,
             },
             _ => unreachable!("validated block format id must have a specification"),
         })
@@ -117,7 +117,7 @@ impl FileLayout {
 ///
 /// This carries only block layout fields that are persisted in worker block
 /// metadata or sent across the data path. It does not validate ownership,
-/// stamps, worker run ids, write stream sequence, or file-version state.
+/// worker run ids, write stream ordering, or file content generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockShape {
     pub block_format_id: BlockFormatId,
@@ -239,15 +239,15 @@ mod tests {
 
     #[test]
     fn block_shape_rejects_invalid_size_format_and_effective_length() {
-        let chunk_size = BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size;
+        let chunk_size = BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size;
         let cases = [
             (
-                BlockShape::new(BlockFormatId::FULL_EFFECTIVE, 0, chunk_size, 1),
+                BlockShape::new(BlockFormatId::DURABLE_PREFIX, 0, chunk_size, 1),
                 BlockShapeError::ZeroBlockSize,
             ),
             (
                 BlockShape::new(
-                    BlockFormatId::FULL_EFFECTIVE,
+                    BlockFormatId::DURABLE_PREFIX,
                     u64::from(MAX_BLOCK_SIZE) + 1,
                     chunk_size,
                     u64::from(MAX_BLOCK_SIZE) + 1,
@@ -258,18 +258,18 @@ mod tests {
                 },
             ),
             (
-                BlockShape::new(BlockFormatId::FULL_EFFECTIVE, 4096, chunk_size - 1, 1),
+                BlockShape::new(BlockFormatId::DURABLE_PREFIX, 4096, chunk_size - 1, 1),
                 BlockShapeError::StorageChunkSizeMismatch {
                     expected: chunk_size,
                     got: chunk_size - 1,
                 },
             ),
             (
-                BlockShape::new(BlockFormatId::FULL_EFFECTIVE, 4096, chunk_size, 0),
+                BlockShape::new(BlockFormatId::DURABLE_PREFIX, 4096, chunk_size, 0),
                 BlockShapeError::ZeroEffectiveLen,
             ),
             (
-                BlockShape::new(BlockFormatId::FULL_EFFECTIVE, 4096, chunk_size, 4097),
+                BlockShape::new(BlockFormatId::DURABLE_PREFIX, 4096, chunk_size, 4097),
                 BlockShapeError::EffectiveLenExceedsBlock,
             ),
         ];

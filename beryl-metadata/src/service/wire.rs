@@ -4,7 +4,6 @@
 //! Proto/domain and response-header conversion for metadata services.
 
 use super::filesystem::{FsFailure, FsSuccess, RequestContext};
-use crate::error::MetadataError;
 use beryl_common::error::rpc::{ErrorKind, ProtocolErrorKind, RpcErrorDetail};
 use beryl_common::header::{RequestHeader, ResponseHeader};
 use beryl_types::{FileBlockLocation, GroupName, GroupStateWatermark, LocatedBlock};
@@ -153,35 +152,6 @@ pub fn header_from_rpc_error(
     header.mount_epoch = mount_epoch;
     header.error = error_detail_from_rpc_error(err);
     header
-}
-
-pub(crate) fn file_attrs_to_proto(attrs: &beryl_types::fs::FileAttrs) -> beryl_proto::metadata::FileAttrsProto {
-    beryl_proto::metadata::FileAttrsProto {
-        mode: attrs.mode,
-        uid: attrs.uid,
-        gid: attrs.gid,
-        size: attrs.size,
-        atime_ms: attrs.atime_ms,
-        mtime_ms: attrs.mtime_ms,
-        ctime_ms: attrs.ctime_ms,
-        nlink: attrs.nlink,
-    }
-}
-
-pub(crate) fn file_attrs_from_proto(
-    attrs: Option<beryl_proto::metadata::FileAttrsProto>,
-) -> Result<beryl_types::fs::FileAttrs, MetadataError> {
-    let attrs = attrs.ok_or_else(|| MetadataError::InvalidArgument("Missing FileAttrs".to_string()))?;
-    Ok(beryl_types::fs::FileAttrs {
-        mode: attrs.mode,
-        uid: attrs.uid,
-        gid: attrs.gid,
-        size: attrs.size,
-        atime_ms: attrs.atime_ms,
-        mtime_ms: attrs.mtime_ms,
-        ctime_ms: attrs.ctime_ms,
-        nlink: attrs.nlink,
-    })
 }
 
 pub(crate) fn located_block_to_proto(target: &LocatedBlock) -> beryl_proto::metadata::LocatedBlockProto {

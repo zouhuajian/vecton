@@ -84,25 +84,18 @@ impl RocksDBStorage {
     }
 
     pub(crate) fn get_layout_optional(&self, inode_id: InodeId) -> MetadataResult<Option<FileLayout>> {
-        crate::observe::record_rocksdb_read("layout");
-        let generation = self.pin_generation()?;
-        let db = generation.db();
-        let cf = db
-            .cf_handle(CF_META)
-            .ok_or_else(|| MetadataError::Internal("Meta CF not found".to_string()))?;
-        let key = format!("layout:{}", inode_id.as_raw());
-        match db.get_cf(cf, key.as_bytes()) {
-            Ok(Some(value)) => {
-                let (layout, _): (FileLayout, usize) = decode_from_slice(&value, standard())
-                    .map_err(|e| MetadataError::Internal(format!("Failed to deserialize file layout: {}", e)))?;
-                layout
-                    .validate()
-                    .map_err(|e| MetadataError::Internal(format!("Invalid file layout: {}", e)))?;
-                Ok(Some(layout))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(MetadataError::Internal(format!("RocksDB error: {}", e))),
-        }
+        self.get_inode(inode_id)?
+            .map(|inode| match inode.kind {
+                crate::inode::InodeKind::File(file) => {
+                    file.layout
+                        .validate()
+                        .map_err(|error| MetadataError::Internal(format!("invalid file layout: {error}")))?;
+                    Ok(Some(file.layout))
+                }
+                crate::inode::InodeKind::Dir => Ok(None),
+            })
+            .transpose()
+            .map(Option::flatten)
     }
 
     fn get_meta_u64_optional(&self, key: &[u8], label: &str) -> MetadataResult<Option<u64>> {
@@ -142,8 +135,8 @@ impl RocksDBStorage {
 
         let matching_inode = root_inode.as_ref().is_some_and(|inode| {
             inode.inode_id == crate::mount::ROOT_INODE_ID
-                && inode.kind.is_dir()
-                && matches!(inode.data, crate::inode::InodeData::Dir)
+                && inode.file_type().is_dir()
+                && matches!(inode.kind, crate::inode::InodeKind::Dir)
                 && inode.mount_id == MountId::new(1)
         });
         let matching_mount = mounts.len() == 1
@@ -609,7 +602,8 @@ impl RocksDBStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::fs::FileAttrs;
+    use crate::inode::InodeAttrs;
+
     use tempfile::TempDir;
 
     impl RocksDBStorage {
@@ -645,7 +639,7 @@ mod tests {
         let storage = RocksDBStorage::create_for_format(&db_path).unwrap();
 
         // Create parent dir and some child nodes.
-        let parent_inode = Inode::new_dir(parent_inode_id, FileAttrs::new(), MountId::new(1));
+        let parent_inode = Inode::new_dir(parent_inode_id, InodeAttrs::new(), MountId::new(1));
         storage.put_inode(&parent_inode).unwrap();
 
         for (name, child) in entries {

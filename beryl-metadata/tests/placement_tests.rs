@@ -38,7 +38,7 @@ fn worker(group_name: &GroupName, worker_id: u64, worker_run_id: WorkerRunId, ho
             tier: Tier::Hdd,
             free_bytes: 4096,
         }],
-        supported_block_formats: vec![BlockFormatId::FULL_EFFECTIVE],
+        supported_block_formats: vec![BlockFormatId::DURABLE_PREFIX],
     }
 }
 
@@ -48,7 +48,7 @@ fn request(group_name: &GroupName, op: PlacementOp, block_id: BlockId) -> Placem
         group_name: group_name.clone(),
         op,
         block_id,
-        block_stamp: Some(9),
+        visible_len: 64,
         layout,
         caller: None,
         existing: Vec::new(),

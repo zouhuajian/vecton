@@ -31,7 +31,7 @@ pub(crate) struct PlannedBlockRead {
     pub(crate) end_file_offset: u64,
     pub(crate) block_id: BlockId,
     pub(crate) block_offset: u64,
-    pub(crate) block_stamp: u64,
+
     pub(crate) block_format_id: BlockFormatId,
     pub(crate) block_size: u64,
     pub(crate) chunk_size: u32,
@@ -83,39 +83,32 @@ pub(crate) fn plan_block_reads(
                 expected_inode_id.as_raw()
             )));
         }
-        let block_stamp = location.block_stamp;
-        if block_stamp == 0 {
-            return Err(ClientError::invalid_layout(format!(
-                "block location {} has zero block_stamp",
-                block_id
-            )));
-        }
         BlockShape::new(
             location.block_format_id,
             location.block_size,
             location.chunk_size,
             location.effective_len,
         )
-        .map_err(|err| ClientError::invalid_layout(format!("block location {block_id} has invalid shape: {err}")))?;
+        .map_err(|error| ClientError::invalid_layout(format!("invalid block shape: {error}")))?;
         if location.workers.is_empty() {
             return Err(block_location_unavailable_error(format!(
-                "block location unavailable: metadata returned no worker candidates for block {} file_offset={} len={} block_stamp={}",
-                block_id, location.file_offset, location.len, block_stamp
+                "block location unavailable: metadata returned no worker candidates for block {} file_offset={} len={}",
+                block_id, location.file_offset, location.len
             )));
         }
         if end <= requested_range.file_offset || location.file_offset >= requested_range.end_file_offset() {
             continue;
         }
-        normalized.push((location.file_offset, end, block_id, block_stamp, location));
+        normalized.push((location.file_offset, end, block_id, location));
     }
-    normalized.sort_by_key(|(start, _, block_id, _, _)| (*start, block_id.index.as_raw()));
+    normalized.sort_by_key(|(start, _, block_id, _)| (*start, block_id.index.as_raw()));
 
     let mut block_reads = Vec::with_capacity(normalized.len());
     let mut cursor = requested_range.file_offset;
     let requested_end = requested_range.end_file_offset();
     let mut previous_end = None;
 
-    for (start, end, block_id, block_stamp, location) in normalized {
+    for (start, end, block_id, location) in normalized {
         if let Some(prev_end) = previous_end {
             if start < prev_end {
                 return Err(ClientError::invalid_layout(format!(
@@ -152,7 +145,6 @@ pub(crate) fn plan_block_reads(
             end_file_offset: read_end,
             block_id,
             block_offset: read_start - start,
-            block_stamp,
             block_format_id: location.block_format_id,
             block_size: location.block_size,
             chunk_size: location.chunk_size,
@@ -237,17 +229,16 @@ mod tests {
             (
                 "gap",
                 12,
-                vec![location(10, 0, 0, 4, 101), location(10, 1, 8, 8, 202)],
+                vec![location(10, 0, 0, 4), location(10, 1, 8, 8)],
                 "layout gap",
             ),
             (
                 "overlap",
                 12,
-                vec![location(10, 0, 0, 8, 101), location(10, 1, 4, 8, 202)],
+                vec![location(10, 0, 0, 8), location(10, 1, 4, 8)],
                 "layout overlap",
             ),
-            ("zero length", 4, vec![location(10, 0, 0, 0, 101)], "zero-length"),
-            ("zero block stamp", 4, vec![location(10, 0, 0, 4, 0)], "block_stamp"),
+            ("zero length", 4, vec![location(10, 0, 0, 0)], "zero-length"),
         ];
 
         for (case, len, locations, expected) in cases {
@@ -272,7 +263,7 @@ mod tests {
                 inode_id: InodeId::new(10),
                 file_size,
                 generation: generation.map(ContentGeneration::new),
-                locations: vec![location(10, 0, 0, 4, 101)],
+                locations: vec![location(10, 0, 0, 4)],
             };
             let err = plan_block_reads_from_layout(InodeId::new(10), ContentGeneration::new(1), 4, range, &layout)
                 .expect_err("opened-file authority mismatch must fail");
@@ -280,7 +271,7 @@ mod tests {
         }
     }
 
-    fn location(inode_id: u64, block_index: u32, file_offset: u64, len: u64, block_stamp: u64) -> FileBlockLocation {
+    fn location(inode_id: u64, block_index: u32, file_offset: u64, len: u64) -> FileBlockLocation {
         FileBlockLocation {
             block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
             file_offset,
@@ -291,7 +282,6 @@ mod tests {
                 worker_net_protocol: WorkerNetProtocol::Grpc,
                 worker_run_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
             }],
-            block_stamp,
             block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,
             chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,

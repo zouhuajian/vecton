@@ -518,7 +518,6 @@ fn client_kind_from_rpc(kind: ErrorKind) -> ClientErrorKind {
             | WorkerErrorKind::DescriptorMismatch
             | WorkerErrorKind::FullReportRequired
             | WorkerErrorKind::BlockLocationUnavailable
-            | WorkerErrorKind::BlockStampMismatch
             | WorkerErrorKind::NodeUnavailable => ClientErrorKind::Unavailable,
         },
         ErrorKind::Protocol(kind) => match kind {

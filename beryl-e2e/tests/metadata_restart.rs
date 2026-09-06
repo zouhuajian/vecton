@@ -13,7 +13,7 @@ use beryl_proto::metadata::get_block_locations_request_proto::Target;
 use beryl_proto::metadata::{
     AbortFileWriteRequestProto, AllocateBlockRequestProto, CommitFileRequestProto, CommittedBlockProto,
     CreateFileRequestProto, GetBlockLocationsRequestProto, LocatedBlockProto, OpenWriteModeProto,
-    OpenWriteRequestProto, WriteHandleProto,
+    OpenWriteRequestProto, SyncWriteRequestProto, WriteHandleProto,
 };
 use beryl_proto::worker::worker_data_service_client::WorkerDataServiceClient;
 use beryl_proto::worker::write_block_request_proto::Payload;
@@ -409,7 +409,7 @@ async fn block_index_continues_after_restart_and_more_than_ten_allocations() {
             write_handle: Some(new_handle),
             committed_blocks: vec![CommittedBlockProto {
                 block_id: Some(block_id),
-                file_offset: target.file_offset,
+
                 len: payload.len() as u64,
             }],
             final_size: payload.len() as u64,
@@ -531,6 +531,159 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> f
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tail_takeover_preserves_published_prefix_after_abort_or_metadata_restart() {
+    for restart in [false, true] {
+        let mut cluster = TestCluster::start().await.unwrap();
+        let client = cluster.client().clone();
+        let path = "/tail-takeover";
+        let prefix = Bytes::from(vec![b'a'; 317]);
+        let mut writer = client.create(path).await.unwrap();
+        writer.write_all(prefix.clone()).await.unwrap();
+        writer.close().await.unwrap();
+        let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
+            .await
+            .unwrap();
+        let opened = metadata
+            .open_write(OpenWriteRequestProto {
+                header: Some(metadata_header(901)),
+                path: path.into(),
+                mode: OpenWriteModeProto::OpenWriteModeAppend as i32,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_metadata_ok(opened.header);
+        let mut tail = opened.tail_block.expect("OpenWrite reuses partial tail");
+        assert_eq!(tail.write_offset, 317);
+        write_worker_target(&tail, b"unpublished").await.unwrap();
+        tail.write_offset += 11;
+        if restart {
+            cluster.restart_metadata().await.unwrap();
+        } else {
+            let aborted = metadata
+                .abort_file_write(AbortFileWriteRequestProto {
+                    header: Some(metadata_header(901)),
+                    write_handle: opened.write_handle,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_metadata_ok(aborted.header);
+        }
+        assert!(
+            write_worker_target(&tail, b"late").await.is_err(),
+            "persisted token alone cannot authorize a new RPC"
+        );
+        let suffix = Bytes::from(vec![b'b'; 800]);
+        let mut appender = client.append(path).await.unwrap();
+        appender.write_all(suffix.clone()).await.unwrap();
+        appender.close().await.unwrap();
+        let actual = client.open(path).await.unwrap().read_to_end().await.unwrap();
+        assert_eq!(actual.as_ref(), [prefix.as_ref(), suffix.as_ref()].concat());
+        let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
+            .await
+            .unwrap();
+        let layout = metadata
+            .get_block_locations(GetBlockLocationsRequestProto {
+                header: Some(metadata_header(902)),
+                target: Some(Target::Path(path.into())),
+                range: Some(ByteRangeProto { offset: 0, len: 1117 }),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_metadata_ok(layout.header);
+        assert_eq!(layout.locations.len(), 2);
+        assert_eq!(
+            layout.locations[0].block_id, tail.block_id,
+            "tail identity survives session boundaries"
+        );
+        assert_eq!(layout.locations[0].len, 1024);
+        assert_eq!(
+            cluster.physical_block_count().unwrap(),
+            2,
+            "no replacement or orphan tail block is allocated"
+        );
+        cluster.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overwrite_sync_replay_keeps_the_append_phase_and_invalidates_fresh_reads() {
+    let mut cluster = TestCluster::start().await.unwrap();
+    let client = cluster.client().clone();
+    let path = "/overwrite-sync";
+    let mut original = client.create(path).await.unwrap();
+    original.write_all(Bytes::from_static(b"original")).await.unwrap();
+    original.close().await.unwrap();
+    let reader = client.open(path).await.unwrap();
+    let mut metadata = FileSystemServiceProtoClient::connect(cluster.metadata_endpoint())
+        .await
+        .unwrap();
+    let opened = metadata
+        .open_write(OpenWriteRequestProto {
+            header: Some(metadata_header(903)),
+            path: path.into(),
+            mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_metadata_ok(opened.header);
+    assert_eq!(opened.base_size, 8);
+    assert!(opened.tail_block.is_none());
+    let handle = opened.write_handle.unwrap();
+    let mut target = allocate_block(&mut metadata, handle, None, metadata_header(903)).await;
+    write_worker_target(&target, b"new").await.unwrap();
+    let frozen = SyncWriteRequestProto {
+        header: Some(metadata_header(903)),
+        write_handle: Some(handle),
+        committed_blocks: vec![CommittedBlockProto {
+            block_id: target.block_id,
+            len: 3,
+        }],
+        target_size: 3,
+        expected_generation: opened.generation,
+        expected_file_size: 8,
+        write_mode: OpenWriteModeProto::OpenWriteModeWrite as i32,
+    };
+    let published = metadata.sync_write(frozen.clone()).await.unwrap().into_inner();
+    assert_metadata_ok(published.header);
+    // Repeat the original frozen request as a client resolving an unknown response would.
+    let replay = metadata.sync_write(frozen).await.unwrap().into_inner();
+    assert_metadata_ok(replay.header);
+    assert_eq!(replay.generation, published.generation);
+    assert!(
+        reader.read_at(0, &mut [0u8; 1]).await.is_err(),
+        "new layout invalidates the old generation"
+    );
+    target.write_offset = 3;
+    write_worker_target(&target, b"tail").await.unwrap();
+    let committed = metadata
+        .commit_file(CommitFileRequestProto {
+            header: Some(metadata_header(903)),
+            write_handle: Some(handle),
+            committed_blocks: vec![CommittedBlockProto {
+                block_id: target.block_id,
+                len: 7,
+            }],
+            final_size: 7,
+            expected_generation: published.generation.unwrap(),
+            expected_file_size: 3,
+            write_mode: OpenWriteModeProto::OpenWriteModeAppend as i32,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_metadata_ok(committed.header);
+    assert_eq!(
+        client.open(path).await.unwrap().read_to_end().await.unwrap(),
+        b"newtail"[..]
+    );
+    cluster.shutdown().await.unwrap();
+}
+
 struct RawWorkerReadyWrite {
     write_handle: WriteHandleProto,
     committed_block: CommittedBlockProto,
@@ -565,7 +718,7 @@ async fn raw_create_worker_ready_block(
     write_worker_target(&target, payload).await?;
     let committed_block = CommittedBlockProto {
         block_id: target.block_id,
-        file_offset: target.file_offset,
+
         len: payload.len() as u64,
     };
 
@@ -646,7 +799,8 @@ async fn write_worker_target(target: &LocatedBlockProto, payload: &[u8]) -> Test
                     block_format_id: target.block_format_id,
                     block_size: target.block_size,
                     chunk_size: target.chunk_size,
-                    block_stamp: target.block_stamp,
+                    fencing_token: target.fencing_token,
+                    write_offset: target.write_offset,
                     tier: target.tier,
                 }))),
             },
@@ -663,8 +817,8 @@ async fn write_worker_target(target: &LocatedBlockProto, payload: &[u8]) -> Test
 
 async fn assert_no_committed_bytes(cluster: &TestCluster, path: &str) -> TestResult<()> {
     match cluster.client().get_status(path).await {
-        Ok(FileStatus { attrs, .. }) => {
-            assert_eq!(attrs.size, 0, "{path} must not publish incomplete bytes");
+        Ok(FileStatus { len, .. }) => {
+            assert_eq!(len, 0, "{path} must not publish incomplete bytes");
         }
         Err(err) => assert_not_found(&err),
     }

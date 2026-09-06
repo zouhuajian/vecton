@@ -64,7 +64,7 @@ const ROCKSDB_SCHEMA_VERSION_KEY: &[u8] = b"rocksdb_schema_version";
 const STORAGE_IDENTITY_KEY: &[u8] = b"storage_identity";
 const RAFT_STATE_KEY: &[u8] = b"raft_state";
 /// Guards database and snapshot decoding against incompatible persisted metadata encodings.
-pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 3;
+pub(crate) const ROCKSDB_SCHEMA_VERSION: u64 = 4;
 const NEXT_INODE_ID_KEY: &[u8] = b"next_inode_id";
 const CREATE_FILE_REPLAY_COUNT_KEY: &[u8] = b"create_file_replay_count";
 const CREATE_FILE_REPLAY_PREFIX: &[u8] = b"create_file_replay/";
@@ -214,7 +214,6 @@ pub(crate) struct RenameAtomicUpdate<'a> {
     pub overwritten_target: Option<RenameOverwriteCleanup>,
     pub updated_src_parent: Option<&'a Inode>,
     pub updated_dst_parent: Option<&'a Inode>,
-    pub updated_src_inode: &'a Inode,
 }
 
 /// One namespace child removed from a detached directory in a bounded apply.
@@ -225,7 +224,7 @@ pub(crate) struct DetachedRootReclaimEntry {
     pub(crate) parent_inode_id: InodeId,
     pub(crate) name: String,
     pub(crate) inode_id: InodeId,
-    pub(crate) remove_file_layout: bool,
+
     pub(crate) child_detached_root: Option<DetachedRoot>,
 }
 
@@ -243,11 +242,6 @@ impl DetachedRootReclaimEntry {
             bytes = bytes
                 .checked_add(RocksDBStorage::encode_inode_key(self.inode_id).len())
                 .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
-            if self.remove_file_layout {
-                bytes = bytes
-                    .checked_add(RocksDBStorage::encode_layout_key(self.inode_id).len())
-                    .ok_or_else(|| MetadataError::Internal("detached-root logical byte count overflow".to_string()))?;
-            }
         }
         Ok(bytes)
     }
@@ -358,10 +352,6 @@ impl RocksDBStorage {
             )));
         }
         Ok(detached_root)
-    }
-
-    fn encode_layout_key(inode_id: InodeId) -> Vec<u8> {
-        format!("layout:{}", inode_id.as_raw()).into_bytes()
     }
 
     fn encode_create_file_operation_bytes(operation_id: CreateFileOperationId) -> [u8; 32] {

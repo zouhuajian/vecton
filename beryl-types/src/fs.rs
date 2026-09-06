@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Beryl Contributors
 
-//! Shared filesystem attributes, write modes, and visible extent types.
+//! Shared filesystem attributes, write modes, and content generations.
 //!
 //! Metadata owns persisted inode state; these domain values remain independent
 //! of transport (gRPC/proto) and storage (RocksDB) layers.
 
-use crate::ids::BlockId;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result};
 
@@ -51,12 +50,12 @@ impl Display for ContentGeneration {
     }
 }
 
-/// Largest number of extents stored in one file inode by the inline layout.
+/// Largest number of blocks stored in one file inode by the inline layout.
 ///
 /// This fixed ceiling bounds replicated publication and inode serialization.
-/// Files that need more extents require paged extent storage rather than a
+/// Files that need more blocks require paged block storage rather than a
 /// larger inline vector.
-pub const MAX_FILE_EXTENTS: usize = 10_000;
+pub const MAX_FILE_BLOCKS: usize = 10_000;
 
 /// Payload-free namespace type tag, independent of inode storage layout.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
@@ -66,8 +65,6 @@ pub enum FileType {
     File,
     /// Directory.
     Dir,
-    /// Symbolic link.
-    Symlink,
 }
 
 impl FileType {
@@ -82,95 +79,6 @@ impl FileType {
     pub fn is_file(self) -> bool {
         matches!(self, FileType::File)
     }
-
-    /// Returns true if this is a symlink.
-    #[inline]
-    pub fn is_symlink(self) -> bool {
-        matches!(self, FileType::Symlink)
-    }
-}
-
-/// File attributes (metadata for inodes).
-///
-/// All timestamps are in milliseconds since Unix epoch.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileAttrs {
-    /// File mode (permissions + type bits).
-    pub mode: u32,
-    /// User ID.
-    pub uid: u32,
-    /// Group ID.
-    pub gid: u32,
-    /// File size in bytes.
-    pub size: u64,
-    /// Access time (milliseconds since Unix epoch).
-    pub atime_ms: u64,
-    /// Modification time (milliseconds since Unix epoch).
-    pub mtime_ms: u64,
-    /// Change time (milliseconds since Unix epoch).
-    pub ctime_ms: u64,
-    /// Number of hard links.
-    pub nlink: u32,
-}
-
-impl FileAttrs {
-    /// Creates new file attributes with default values.
-    pub fn new() -> Self {
-        Self {
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            size: 0,
-            atime_ms: 0,
-            mtime_ms: 0,
-            ctime_ms: 0,
-            nlink: 1,
-        }
-    }
-
-    /// Updates timestamps to current time (in milliseconds).
-    pub fn update_timestamps(&mut self, now_ms: u64) {
-        self.atime_ms = now_ms;
-        self.mtime_ms = now_ms;
-        self.ctime_ms = now_ms;
-    }
-
-    /// Updates mtime and ctime.
-    pub fn update_mtime_ctime(&mut self, now_ms: u64) {
-        self.mtime_ms = now_ms;
-        self.ctime_ms = now_ms;
-    }
-
-    /// Updates ctime only.
-    pub fn update_ctime(&mut self, now_ms: u64) {
-        self.ctime_ms = now_ms;
-    }
-}
-
-impl Default for FileAttrs {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// File extent: maps file offset range to block (supports append-only write path).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Extent {
-    /// File offset (start of this extent in the file).
-    pub file_offset: u64,
-    /// Block ID that contains this extent.
-    pub block_id: BlockId,
-    /// Offset within the block (where this extent starts in the block).
-    pub block_offset: u64,
-    /// Length of this extent in bytes.
-    pub len: u64,
-    /// Content generation for the committed file state that owns this extent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation: Option<ContentGeneration>,
-    /// Metadata-assigned block stamp for direct read validation.
-    /// Readable committed extents must carry a non-zero value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub block_stamp: Option<u64>,
 }
 
 #[cfg(test)]

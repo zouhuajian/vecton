@@ -956,6 +956,7 @@ impl RocksDBStorage {
 mod tests {
     use super::*;
     use crate::inode::Inode;
+    use crate::inode::InodeAttrs;
     use crate::mount::{DataIoPolicy, MountEntry, MountKind, MountTable};
     use crate::raft::state_machine::AppRaftStateMachine;
     use crate::raft::storage::DetachedRoot;
@@ -964,7 +965,7 @@ mod tests {
         MAX_RECLAIM_DETACHED_ROOT_ENTRIES,
     };
     use crate::state::RouteEpoch;
-    use beryl_types::fs::FileAttrs;
+
     use beryl_types::ids::{InodeId, MountId};
     use beryl_types::GroupName;
     use metrics::{Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
@@ -1108,7 +1109,7 @@ mod tests {
             proposed_at_ms: crate::raft::proposal_timestamp_ms(),
             root_inode_id: parent_inode_id,
             components: vec!["child".to_string()],
-            attrs: FileAttrs::new(),
+            attrs: InodeAttrs::new(),
             recursive: false,
         };
 
@@ -1153,18 +1154,23 @@ mod tests {
         storage_a
             .put_inode(&Inode::new_dir(
                 detached_inode_id,
-                FileAttrs::new(),
+                InodeAttrs::new(),
                 snapshot_mount.mount_id,
             ))
             .unwrap();
         storage_a.put_detached_root(detached_inode_id, detached_root).unwrap();
 
         let file_id = InodeId::new(72);
-        let mut file = Inode::new_file(file_id, FileAttrs::new(), snapshot_mount.mount_id);
-        let crate::inode::InodeData::File { lease_epoch, .. } = &mut file.data else {
+        let mut file = Inode::new_file(
+            file_id,
+            InodeAttrs::new(),
+            snapshot_mount.mount_id,
+            beryl_types::FileLayout::new(4096),
+        );
+        let crate::inode::InodeKind::File(crate::inode::FileData { lease_epoch, .. }) = &mut file.kind else {
             unreachable!()
         };
-        *lease_epoch = Some(beryl_types::LeaseEpoch::new(1));
+        *lease_epoch = beryl_types::LeaseEpoch::new(1);
         storage_a.put_inode(&file).unwrap();
         storage_a
             .put_layout(file_id, beryl_types::FileLayout::new(1024))
@@ -1175,7 +1181,7 @@ mod tests {
             client_id: beryl_types::ClientId::new(9),
             call_id: beryl_types::CallId::new(),
             publication: crate::inode::FilePublication {
-                extents: Vec::new(),
+                blocks: Vec::new(),
                 target_size: 0,
                 expected_generation: beryl_types::ContentGeneration::new(0),
                 expected_file_size: 0,

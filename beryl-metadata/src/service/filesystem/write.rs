@@ -9,7 +9,6 @@ use super::{
     Freshness, FsResult, FsSuccess, MetadataFileSystem, RequestContext, WriteHandle, SUPPORTED_REPLICA_COUNT,
 };
 use crate::error::MetadataError;
-use crate::inode::InodeData;
 use crate::observe;
 use crate::path_resolver::{PathResolver, ResolvedPath};
 use crate::placement::{PlacementOp, PlacementPlanner, PlacementRequest, PlacementStatus};
@@ -25,6 +24,17 @@ use beryl_types::layout::FileLayout;
 use beryl_types::lease::FencingToken;
 use beryl_types::{ContentGeneration, LeaseEpoch, LocatedBlock, WriteMode};
 
+/// Exact stream facts checked against the active session and durable inode authority.
+pub(crate) struct AuthorizeBlockWriteArgs {
+    pub group_name: beryl_types::GroupName,
+    pub worker_id: beryl_types::WorkerId,
+    pub worker_run_id: beryl_types::WorkerRunId,
+    pub fencing_token: FencingToken,
+    pub write_offset: u64,
+    pub shape: beryl_types::layout::BlockShape,
+    pub tier: beryl_types::Tier,
+}
+
 /// Acquired writer authority and visible base returned to the client.
 #[derive(Clone, Debug)]
 pub(crate) struct OpenWriteOutput {
@@ -34,6 +44,7 @@ pub(crate) struct OpenWriteOutput {
     pub(crate) base_size: u64,
     pub(crate) expires_at_ms: u64,
     pub(crate) generation: ContentGeneration,
+    pub(crate) tail_block: Option<LocatedBlock>,
 }
 
 /// Block registered in the active allocation chain before RPC success is returned.
@@ -65,6 +76,97 @@ pub(crate) struct RenewLeaseArgs {
 }
 
 impl MetadataFileSystem {
+    /// Authorizes one stream from the same session registry used by publication and cleanup.
+    /// A linearizable read prevents an old leader from issuing a new write authorization.
+    pub(crate) async fn authorize_block_write(
+        &self,
+        ctx: &RequestContext,
+        args: AuthorizeBlockWriteArgs,
+    ) -> FsResult<u64> {
+        let inode_id = args.fencing_token.block_id.inode_id;
+        if let Some(failure) = self.session_write_admission_failure(ctx, inode_id) {
+            return self.failure_from_admission(failure);
+        }
+        let result = async {
+            let raft = self.raft_node.as_ref().ok_or_else(|| {
+                MetadataError::ServiceUnavailable("write authorization requires Raft authority".into())
+            })?;
+            raft.read(true, |_| {
+                let invalid = || MetadataError::PermissionDenied("block writer is no longer authorized".into());
+                let session = self.session_registry.get_session(inode_id).ok_or_else(invalid)?;
+                self.session_registry
+                    .validate_session(inode_id, args.fencing_token.epoch)
+                    .map_err(|_| invalid())?;
+                if session.open_client_id != args.fencing_token.owner || session.lease_epoch != args.fencing_token.epoch
+                {
+                    return Err(invalid());
+                }
+                let inode = self.storage.get_inode(inode_id)?.ok_or_else(invalid)?;
+                let mount = self.mount_table.get_mount(inode.mount_id)?.ok_or_else(invalid)?;
+                if mount.namespace_owner_group_name != args.group_name
+                    || ctx.caller.group_name.as_ref() != Some(&args.group_name)
+                {
+                    return Err(invalid());
+                }
+                let file = inode.file()?;
+                file.validate(inode_id)?;
+                if file.lease_epoch != session.lease_epoch {
+                    return Err(invalid());
+                }
+                let target = session
+                    .issued_targets
+                    .iter()
+                    .find(|target| target.block_id == args.fencing_token.block_id)
+                    .ok_or_else(invalid)?;
+                if target.fencing_token != args.fencing_token
+                    || target.block_size != args.shape.block_size
+                    || target.block_format_id != args.shape.block_format_id
+                    || target.chunk_size != args.shape.chunk_size
+                    || target.tier != args.tier
+                    || args.write_offset < target.write_offset
+                    || args.write_offset >= target.block_size
+                {
+                    return Err(invalid());
+                }
+                if !target.worker_endpoints.iter().any(|endpoint| {
+                    endpoint.worker_id == args.worker_id && endpoint.worker_run_id == args.worker_run_id
+                }) {
+                    return Err(invalid());
+                }
+                let manager = self.worker_manager.as_ref().ok_or_else(invalid)?;
+                if !manager
+                    .collect_worker_placement_views(&args.group_name)
+                    .iter()
+                    .any(|worker| {
+                        worker.worker_id == args.worker_id
+                            && worker.worker_run_id == Some(args.worker_run_id)
+                            && worker.lease_valid
+                    })
+                {
+                    return Err(invalid());
+                }
+                let visible_len = match file
+                    .blocks
+                    .iter()
+                    .position(|block| *block == args.fencing_token.block_id)
+                {
+                    Some(ordinal) => file.block_len(ordinal),
+                    None => 0,
+                };
+                if visible_len > args.write_offset {
+                    return Err(invalid());
+                }
+                Ok(visible_len)
+            })
+            .await
+        }
+        .await;
+        match result {
+            Ok(visible_len) => self.success(visible_len, Some(args.group_name), None),
+            Err(error) => self.failure_from_error(ctx, error, Some(args.group_name), None),
+        }
+    }
+
     /// Admit one allocation or replay without changing file visibility.
     pub(crate) async fn allocate_block(
         &self,
@@ -427,20 +529,20 @@ impl MetadataFileSystem {
             }
         };
 
-        if inode.inode_id != inode_id || inode.kind != inode.data.kind() {
+        if inode.inode_id != inode_id {
             return self.failure_from_error(
                 ctx,
                 MetadataError::Internal(format!(
                     "inode authority is corrupt for OpenWrite: key={inode_id}, value_id={}, kind={:?}, payload={:?}",
                     inode.inode_id,
-                    inode.kind,
-                    inode.data.kind()
+                    inode.file_type(),
+                    inode.file_type()
                 )),
                 None,
                 None,
             );
         }
-        if !inode.kind.is_file() {
+        if !inode.file_type().is_file() {
             return self.failure_from_error(
                 ctx,
                 MetadataError::IsDir(format!("Inode is not a file: {}", inode_id)),
@@ -467,11 +569,6 @@ impl MetadataFileSystem {
             Err(err) => return Err(err),
         };
 
-        let base_size = match mode {
-            WriteMode::Append => inode.attrs.size,
-            WriteMode::Overwrite => 0,
-        };
-
         let layout = match self.read_layout(inode_id) {
             Ok(layout) => layout,
             Err(err) => {
@@ -481,14 +578,10 @@ impl MetadataFileSystem {
         if let Err(err) = validate_active_write_layout(&layout) {
             return self.failure_from_error(ctx, err, group_name, mount_epoch);
         }
-        let generation = match &inode.data {
-            InodeData::File { generation, .. } => *generation,
-            _ => None,
-        };
 
-        let base_epoch = match &inode.data {
-            InodeData::File { lease_epoch, .. } => *lease_epoch,
-            _ => None,
+        let base_epoch = match inode.file() {
+            Ok(file) => file.lease_epoch,
+            Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
         };
 
         let opening = match self.session_registry.begin_session(BeginSessionInput {
@@ -496,8 +589,6 @@ impl MetadataFileSystem {
             inode_id,
             mount_id: inode.mount_id,
             current_lease_epoch: base_epoch,
-            base_size,
-            generation: generation.unwrap_or_default(),
             mode,
             open_client_id: caller_ctx.client.client_id,
             layout,
@@ -558,7 +649,7 @@ impl MetadataFileSystem {
                 Command::AcquireWriteLease {
                     proposed_at_ms: crate::raft::proposal_timestamp_ms(),
                     inode_id,
-                    expected_lease_epoch: base_epoch.unwrap_or_default(),
+                    expected_lease_epoch: base_epoch,
                 },
                 move |success| match success {
                     ApplySuccess::WriteLeaseAcquired {
@@ -576,7 +667,51 @@ impl MetadataFileSystem {
             }
         }
 
-        let session = match opening.activate(lease_epoch) {
+        // AcquireWriteLease may have ordered behind an earlier publication. Capture
+        // the visible file only after its new durable epoch has been installed.
+        let snapshot = match self
+            .read_inode(inode_id)
+            .and_then(|inode| inode.ok_or_else(|| MetadataError::NotFound("opened file disappeared".into())))
+        {
+            Ok(inode) => inode,
+            Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
+        };
+        let file = match snapshot.file().and_then(|file| {
+            file.validate(inode_id)?;
+            Ok(file)
+        }) {
+            Ok(file) if file.lease_epoch == lease_epoch => file,
+            Ok(_) => {
+                return self.session_terminal_failure(
+                    ctx,
+                    ErrorKind::Metadata(MetadataErrorKind::SessionInvalid),
+                    "opened writer was fenced",
+                    group_name,
+                    mount_epoch,
+                )
+            }
+            Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
+        };
+        let tail_block = if mode == WriteMode::Append && file.len % u64::from(file.layout.block_size) != 0 {
+            let group =
+                self.require_worker_lookup_group(ctx, group_name.clone(), mount_epoch, route_epoch, "OpenWrite")?;
+            match self.locate_append_tail(&group, file, ctx.caller.client.client_id, lease_epoch) {
+                Ok(tail) => Some(tail),
+                Err(error) => return self.failure_from_error(ctx, error, group_name, mount_epoch),
+            }
+        } else {
+            None
+        };
+        let session = match opening.activate(lease_epoch, file, tail_block) {
+            Err(WriteOpeningError::TargetLimit) => {
+                return self.failure_from_error(
+                    ctx,
+                    MetadataError::GlobalWriteTargetLimitExceeded("opening a tail exceeds the target limit".into()),
+                    group_name,
+                    mount_epoch,
+                )
+            }
+
             Ok(result) => result,
             Err(WriteOpeningError::Expired | WriteOpeningError::NotCurrent) => {
                 return self.session_terminal_failure(
@@ -600,6 +735,83 @@ impl MetadataFileSystem {
         };
 
         self.success_with_route_epoch(open_write_output(&session), group_name, mount_epoch, route_epoch)
+    }
+
+    /// Resolves the existing tail on a live replica without allocating a new block identity.
+    fn locate_append_tail(
+        &self,
+        group_name: &beryl_types::GroupName,
+        file: &crate::inode::FileData,
+        owner: beryl_types::ClientId,
+        epoch: LeaseEpoch,
+    ) -> Result<LocatedBlock, MetadataError> {
+        let ordinal = file
+            .blocks
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| MetadataError::Internal("partial file has no tail".into()))?;
+        let block_id = file.blocks[ordinal];
+        let len = file.block_len(ordinal);
+        let manager = self
+            .worker_manager
+            .as_ref()
+            .ok_or_else(|| MetadataError::ServiceUnavailable("Worker manager is unavailable".into()))?;
+        let request = PlacementRequest {
+            group_name: group_name.clone(),
+            op: PlacementOp::Read,
+            block_id,
+            visible_len: len,
+            layout: file.layout,
+            caller: None,
+            existing: manager.reported_block_locations(group_name, block_id),
+            exclude_workers: Vec::new(),
+            target_replicas: SUPPORTED_REPLICA_COUNT,
+        };
+        let placement = PlacementPlanner.plan(&request, &manager.collect_worker_placement_views(group_name));
+        if placement.status != PlacementStatus::Ok {
+            return Err(MetadataError::ServiceUnavailable(placement.failure_message(&request)));
+        }
+        let tier = placement
+            .workers
+            .first()
+            .and_then(|worker| {
+                request
+                    .existing
+                    .iter()
+                    .find(|location| {
+                        location.worker_id == worker.worker_id && location.worker_run_id == worker.worker_run_id
+                    })
+                    .map(|location| location.tier)
+            })
+            .ok_or_else(|| MetadataError::ServiceUnavailable("tail placement has no tier".into()))?;
+        let worker_endpoints = placement
+            .workers
+            .into_iter()
+            .map(|worker| {
+                worker_endpoint_from_parts(
+                    worker.worker_id,
+                    worker.endpoint,
+                    worker.worker_net_protocol,
+                    worker.worker_run_id,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(LocatedBlock {
+            block_id,
+            file_offset: ordinal as u64 * u64::from(file.layout.block_size),
+            block_size: u64::from(file.layout.block_size),
+            worker_endpoints,
+            fencing_token: FencingToken::new(block_id, owner, epoch),
+            write_offset: len,
+            chunk_size: file
+                .layout
+                .block_format_id
+                .spec()
+                .map_err(|e| MetadataError::Internal(e.to_string()))?
+                .storage_chunk_size,
+            block_format_id: file.layout.block_format_id,
+            tier,
+        })
     }
 
     /// Replay an issued target or reserve leader-local capacity before Raft allocation.
@@ -754,7 +966,6 @@ impl MetadataFileSystem {
         };
         let layout = reservation.layout();
         let file_offset = reservation.file_offset();
-        let block_stamp = reservation.block_stamp();
         let open_client_id = reservation.open_client_id();
         let storage_chunk_size = match layout.block_format_id.spec() {
             Ok(spec) => spec.storage_chunk_size,
@@ -790,7 +1001,7 @@ impl MetadataFileSystem {
             group_name: placement_group_name,
             op: PlacementOp::Write,
             block_id,
-            block_stamp: Some(block_stamp),
+            visible_len: 0,
             layout,
             caller: ctx
                 .caller
@@ -854,7 +1065,7 @@ impl MetadataFileSystem {
                 owner: open_client_id,
                 epoch: lease_epoch,
             },
-            block_stamp,
+            write_offset: 0,
             chunk_size: storage_chunk_size,
             block_format_id: layout.block_format_id,
             tier,
@@ -898,6 +1109,11 @@ fn open_write_output(session: &WriteSession) -> OpenWriteOutput {
         base_size: session.base_size,
         expires_at_ms: session.expires_at_ms,
         generation: session.generation,
+        tail_block: session
+            .issued_targets
+            .first()
+            .filter(|target| target.write_offset > 0)
+            .cloned(),
     }
 }
 
@@ -1025,6 +1241,7 @@ impl MetadataFileSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inode::InodeKind;
     use crate::raft::Command;
     use crate::service::filesystem::tests::*;
     use beryl_common::header::RequestHeader;
@@ -1047,7 +1264,12 @@ mod tests {
         let third_inode_id = InodeId::new(492);
         for inode_id in [first_inode_id, second_inode_id, third_inode_id] {
             storage
-                .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
+                .put_inode(&Inode::new_file(
+                    inode_id,
+                    InodeAttrs::new(),
+                    mount_id,
+                    beryl_types::FileLayout::new(4096),
+                ))
                 .unwrap();
             storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
         }
@@ -1154,11 +1376,16 @@ mod tests {
 
         for inode_id in [ROOT_INODE_ID, old_parent_inode_id, new_parent_inode_id] {
             storage
-                .put_inode(&Inode::new_dir(inode_id, FileAttrs::new(), mount_id))
+                .put_inode(&Inode::new_dir(inode_id, InodeAttrs::new(), mount_id))
                 .unwrap();
         }
         storage
-            .put_inode(&Inode::new_file(file_inode_id, FileAttrs::new(), mount_id))
+            .put_inode(&Inode::new_file(
+                file_inode_id,
+                InodeAttrs::new(),
+                mount_id,
+                beryl_types::FileLayout::new(4096),
+            ))
             .unwrap();
         storage.put_dentry(ROOT_INODE_ID, "old", old_parent_inode_id).unwrap();
         storage.put_dentry(ROOT_INODE_ID, "new", new_parent_inode_id).unwrap();
@@ -1217,7 +1444,12 @@ mod tests {
         let group_name_value = group_name("g9");
         let inode_id = InodeId::new(510);
         storage
-            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
+            .put_inode(&Inode::new_file(
+                inode_id,
+                InodeAttrs::new(),
+                mount_id,
+                beryl_types::FileLayout::new(4096),
+            ))
             .unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
 
@@ -1252,8 +1484,8 @@ mod tests {
         let persisted_epoch = storage
             .get_inode(inode_id)
             .unwrap()
-            .and_then(|inode| match inode.data {
-                InodeData::File { lease_epoch, .. } => lease_epoch,
+            .and_then(|inode| match inode.kind {
+                InodeKind::File(crate::inode::FileData { lease_epoch, .. }) => Some(lease_epoch),
                 _ => None,
             })
             .expect("OpenWrite must persist the acquired lease epoch");
@@ -1269,8 +1501,8 @@ mod tests {
             .await
             .expect_err("a duplicate OpenWrite must fail closed while the lease is active");
         assert_fail(&duplicate.error, ErrorKind::Metadata(MetadataErrorKind::Busy));
-        let epoch_after_duplicate = storage.get_inode(inode_id).unwrap().and_then(|inode| match inode.data {
-            InodeData::File { lease_epoch, .. } => lease_epoch,
+        let epoch_after_duplicate = storage.get_inode(inode_id).unwrap().and_then(|inode| match inode.kind {
+            InodeKind::File(crate::inode::FileData { lease_epoch, .. }) => Some(lease_epoch),
             _ => None,
         });
         assert_eq!(epoch_after_duplicate, Some(persisted_epoch));
@@ -1284,7 +1516,12 @@ mod tests {
         let group_name_value = group_name("g10");
         let inode_id = InodeId::new(550);
         storage
-            .put_inode(&Inode::new_file(inode_id, FileAttrs::new(), mount_id))
+            .put_inode(&Inode::new_file(
+                inode_id,
+                InodeAttrs::new(),
+                mount_id,
+                beryl_types::FileLayout::new(4096),
+            ))
             .unwrap();
         storage.put_layout(inode_id, FileLayout::new(4096)).unwrap();
 
@@ -1310,8 +1547,8 @@ mod tests {
             .expect("OpenWrite");
 
         let lease_epoch = opened.payload.lease_epoch;
-        let next_index = || match storage.get_inode(inode_id).unwrap().unwrap().data {
-            InodeData::File { next_block_index, .. } => next_block_index,
+        let next_index = || match storage.get_inode(inode_id).unwrap().unwrap().kind {
+            InodeKind::File(crate::inode::FileData { next_index, .. }) => next_index,
             _ => panic!("expected file"),
         };
         let registry = filesystem.session_registry();

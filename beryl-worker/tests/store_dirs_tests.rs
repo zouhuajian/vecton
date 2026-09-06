@@ -5,7 +5,7 @@ use beryl_types::ids::{BlockId, BlockIndex, InodeId};
 use beryl_types::{BlockFormatId, GroupName, Tier};
 use beryl_worker::config::StoreDirConfig;
 use beryl_worker::store::block::{
-    ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
+    ChecksumKind, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore, OpenBlockWriteRequest,
     ReclaimBlockRequest,
 };
 use beryl_worker::store::dirs::StoreDirs;
@@ -18,7 +18,7 @@ use tempfile::TempDir;
 const BLOCK_SIZE: u64 = 4096;
 
 fn chunk_size() -> u32 {
-    BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size
+    BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size
 }
 
 fn group_name() -> GroupName {
@@ -60,12 +60,19 @@ fn wait_for_refresh() {
     std::thread::sleep(Duration::from_millis(10));
 }
 
-fn staging_req(index: u32) -> CreateStagingBlockRequest {
-    CreateStagingBlockRequest {
+fn open_request(index: u32) -> OpenBlockWriteRequest {
+    OpenBlockWriteRequest {
         group_name: group_name(),
         block_id: block_id(index),
+        fencing_token: beryl_types::FencingToken::new(
+            block_id(index),
+            beryl_types::ClientId::new(9),
+            beryl_types::LeaseEpoch::new(1),
+        ),
+        write_offset: 0,
+        visible_len: 0,
         block_size: BLOCK_SIZE,
-        block_format_id: BlockFormatId::FULL_EFFECTIVE,
+        block_format_id: BlockFormatId::DURABLE_PREFIX,
         chunk_size: chunk_size(),
         checksum_kind: ChecksumKind::None,
         tier: Tier::Hdd,
@@ -88,7 +95,7 @@ fn store_directory_has_one_process_owner() {
 }
 
 #[test]
-fn reclaim_fails_closed_on_staging_artifact_in_any_store_dir() {
+fn reclaim_fails_closed_on_unidentified_data_in_any_store_dir() {
     let temp = TempDir::new().unwrap();
     let hdd0 = temp.path().join("hdd0");
     let hdd1 = temp.path().join("hdd1");
@@ -102,17 +109,18 @@ fn reclaim_fails_closed_on_staging_artifact_in_any_store_dir() {
     )
     .unwrap();
     let raw_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(hdd1));
-    raw_store.create_staging_block(staging_req(0)).unwrap();
+    let paths = raw_store.paths(&group_name(), block_id(0));
+    std::fs::create_dir_all(paths.data_path.parent().unwrap()).unwrap();
+    std::fs::write(&paths.data_path, b"unidentified").unwrap();
     let req = ReclaimBlockRequest {
         group_name: group_name(),
         block_id: block_id(0),
-        expected_block_stamp: 7,
     };
 
     assert!(matches!(store.reclaim_block(&req), Err(WorkerError::Corrupt(_))));
     let paths = raw_store.paths(&group_name(), block_id(0));
-    assert!(paths.staging_data_path.exists());
-    assert!(paths.staging_meta_path.exists());
+    assert!(paths.data_path.exists());
+    assert!(!paths.meta_path.exists());
 }
 
 #[test]
@@ -120,10 +128,9 @@ fn create_failure_releases_pending_reservation() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("hdd0");
     let store = StoreDirs::open(store_dirs(vec![dir_config(path.clone(), 32 * 1024)]), 0, 30_000).unwrap();
-    let raw_store = FullBlockFileStore::new(FullBlockFileStoreConfig::new(path));
-    raw_store.create_staging_block(staging_req(0)).unwrap();
-
-    let duplicate = store.create_staging_block(staging_req(0));
+    let mut invalid = open_request(0);
+    invalid.write_offset = 1;
+    let duplicate = store.open_block_write(invalid);
 
     assert!(duplicate.is_err());
     assert_eq!(store.report().unwrap().pending_bytes, 0);
@@ -148,12 +155,32 @@ fn duplicate_block_reservation_is_rejected_across_store_dirs() {
     )
     .unwrap();
 
-    store.create_staging_block(staging_req(0)).unwrap();
+    store.open_block_write(open_request(0)).unwrap();
     assert!(matches!(
-        store.create_staging_block(staging_req(0)),
+        store.open_block_write(open_request(0)),
         Err(WorkerError::InvalidArgument(_))
     ));
     assert_eq!(store.report().unwrap().pending_bytes, BLOCK_SIZE);
+}
+
+#[test]
+fn reports_do_not_convert_directory_io_errors_into_absence() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("hdd0");
+    let store = StoreDirs::open(store_dirs(vec![dir_config(path.clone(), 32 * 1024)]), 0, 30_000).unwrap();
+    assert!(matches!(
+        store.load_report_meta(&group_name(), block_id(0)),
+        Err(WorkerError::NotFound(_))
+    ));
+    assert!(store.scan_group_blocks(&group_name()).unwrap().is_empty());
+    // ENOTDIR is reproducible without depending on process privileges or a permission race.
+    std::fs::create_dir_all(path.join("groups")).unwrap();
+    std::fs::write(path.join("groups/root"), b"invalid directory").unwrap();
+    assert!(!matches!(
+        store.load_report_meta(&group_name(), block_id(0)),
+        Ok(_) | Err(WorkerError::NotFound(_))
+    ));
+    assert!(store.scan_group_blocks(&group_name()).is_err());
 }
 
 #[test]

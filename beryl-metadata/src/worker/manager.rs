@@ -125,7 +125,6 @@ pub struct ReplicaKey {
     pub worker_id: WorkerId,
     pub worker_run_id: WorkerRunId,
     pub block_id: BlockId,
-    pub block_stamp: u64,
 }
 
 /// Stable exclusive position after one worker or one Ready block.
@@ -200,8 +199,10 @@ pub enum BlockReportBlockState {
 /// of this report view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockReportBlock {
+    /// Persisted replica tier, required for Ready checkpoints.
+    pub tier: Option<beryl_types::Tier>,
     pub block_id: BlockId,
-    pub block_stamp: u64,
+    pub lease_epoch: u64,
     pub block_state: BlockReportBlockState,
     /// Worker-persisted valid byte length. Ready reports must carry a non-zero value.
     pub effective_len: u64,
@@ -294,13 +295,7 @@ pub(crate) enum PublishReadyConflict {
         block_id: BlockId,
         worker_id: WorkerId,
     },
-    BlockStampMismatch {
-        block_id: BlockId,
-        worker_id: WorkerId,
-        expected: u64,
-        reported: u64,
-    },
-    EffectiveLenMismatch {
+    LeaseEpochMismatch {
         block_id: BlockId,
         worker_id: WorkerId,
         expected: u64,
@@ -1341,10 +1336,14 @@ impl WorkerManager {
             if block.block_state != BlockReportBlockState::Ready {
                 continue;
             }
+            let Some(tier) = block.tier else {
+                continue;
+            };
             reported.push(ReportedBlockLocation {
+                tier,
                 group_name: group_name.clone(),
                 block_id,
-                block_stamp: block.block_stamp,
+                durable_len: block.effective_len,
                 worker_id: key.worker_id,
                 worker_run_id,
             });
@@ -1485,7 +1484,6 @@ impl WorkerManager {
                     worker_id: worker_key.worker_id,
                     worker_run_id: report_run_id,
                     block_id: *block_id,
-                    block_stamp: block.block_stamp,
                 });
                 visited += 1;
                 if *block_id == worker_end_block_id {
@@ -1571,9 +1569,10 @@ impl WorkerManager {
             return false;
         };
 
-        active.blocks.get(&replica.block_id).is_some_and(|block| {
-            block.block_state == BlockReportBlockState::Ready && block.block_stamp == replica.block_stamp
-        })
+        active
+            .blocks
+            .get(&replica.block_id)
+            .is_some_and(|block| block.block_state == BlockReportBlockState::Ready)
     }
 
     /// Subscribe before checking Ready evidence so a concurrent report cannot
@@ -1666,22 +1665,19 @@ impl WorkerManager {
                 let Some(block) = active.blocks.get(&target.block_id) else {
                     continue;
                 };
-                if block.block_stamp != target.block_stamp {
-                    conflict = Some(PublishReadyConflict::BlockStampMismatch {
+                if block.lease_epoch < target.fencing_token.epoch.as_raw() {
+                    continue;
+                }
+                if block.lease_epoch > target.fencing_token.epoch.as_raw() {
+                    conflict = Some(PublishReadyConflict::LeaseEpochMismatch {
                         block_id: target.block_id,
                         worker_id: endpoint.worker_id,
-                        expected: target.block_stamp,
-                        reported: block.block_stamp,
+                        expected: target.fencing_token.epoch.as_raw(),
+                        reported: block.lease_epoch,
                     });
                     continue;
                 }
-                if block.block_state == BlockReportBlockState::Ready && block.effective_len != expected.effective_len {
-                    conflict = Some(PublishReadyConflict::EffectiveLenMismatch {
-                        block_id: target.block_id,
-                        worker_id: endpoint.worker_id,
-                        expected: expected.effective_len,
-                        reported: block.effective_len,
-                    });
+                if block.block_state == BlockReportBlockState::Ready && block.effective_len < expected.effective_len {
                     continue;
                 }
                 match block.block_state {
@@ -1746,8 +1742,9 @@ mod tests {
 
     fn report_block_with_id(block_id: BlockId) -> BlockReportBlock {
         BlockReportBlock {
+            tier: Some(beryl_types::Tier::Hdd),
             block_id,
-            block_stamp: u64::from(block_id.index.as_raw()) + 100,
+            lease_epoch: u64::from(block_id.index.as_raw()) + 100,
             block_state: BlockReportBlockState::Ready,
             effective_len: 64,
         }
@@ -1802,11 +1799,12 @@ mod tests {
         worker_id: WorkerId,
         run_id: WorkerRunId,
         block_id: BlockId,
-        block_stamp: u64,
+        lease_epoch: u64,
     ) -> PublishReadyTarget {
         PublishReadyTarget {
             effective_len: 64,
             target: LocatedBlock {
+                write_offset: 0,
                 block_id,
                 file_offset: 0,
                 block_size: 64,
@@ -1819,9 +1817,8 @@ mod tests {
                 fencing_token: FencingToken {
                     block_id,
                     owner: ClientId::new(7),
-                    epoch: LeaseEpoch::new(1),
+                    epoch: LeaseEpoch::new(lease_epoch),
                 },
-                block_stamp,
                 chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
                 block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
                 tier: Tier::Hdd,
@@ -1853,8 +1850,9 @@ mod tests {
                 0,
                 true,
                 vec![BlockReportBlock {
+                    tier: Some(beryl_types::Tier::Hdd),
                     block_id,
-                    block_stamp: 7,
+                    lease_epoch: 7,
                     block_state: BlockReportBlockState::Ready,
                     effective_len: 64,
                 }],
@@ -1878,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_ready_check_rejects_run_stamp_endpoint_and_unreadable_conflicts() {
+    fn publication_ready_check_rejects_run_epoch_endpoint_and_unreadable_conflicts() {
         let manager = WorkerManager::new(60_000);
         let group_name_value = group_name("g-conflict");
         let worker_id = WorkerId::new(5);
@@ -1896,8 +1894,9 @@ mod tests {
                 0,
                 true,
                 vec![BlockReportBlock {
+                    tier: Some(beryl_types::Tier::Hdd),
                     block_id,
-                    block_stamp: 8,
+                    lease_epoch: 8,
                     block_state: BlockReportBlockState::Ready,
                     effective_len: 64,
                 }],
@@ -1905,7 +1904,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
-            PublishReadyStatus::Conflict(PublishReadyConflict::BlockStampMismatch { .. })
+            PublishReadyStatus::Conflict(PublishReadyConflict::LeaseEpochMismatch { .. })
         ));
 
         manager
@@ -1917,8 +1916,9 @@ mod tests {
                 0,
                 true,
                 vec![BlockReportBlock {
+                    tier: Some(beryl_types::Tier::Hdd),
                     block_id,
-                    block_stamp: 7,
+                    lease_epoch: 7,
                     block_state: BlockReportBlockState::Ready,
                     effective_len: 32,
                 }],
@@ -1926,7 +1926,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             manager.check_publish_ready(&group_name_value, std::slice::from_ref(&target)),
-            PublishReadyStatus::Conflict(PublishReadyConflict::EffectiveLenMismatch { .. })
+            PublishReadyStatus::Pending { .. }
         ));
 
         manager
@@ -1938,8 +1938,9 @@ mod tests {
                 0,
                 true,
                 vec![BlockReportBlock {
+                    tier: Some(beryl_types::Tier::Hdd),
                     block_id,
-                    block_stamp: 7,
+                    lease_epoch: 7,
                     block_state: BlockReportBlockState::Corrupt,
                     effective_len: 64,
                 }],
@@ -1998,8 +1999,9 @@ mod tests {
                 0,
                 true,
                 vec![BlockReportBlock {
+                    tier: Some(beryl_types::Tier::Hdd),
                     block_id,
-                    block_stamp: 7,
+                    lease_epoch: 7,
                     block_state: BlockReportBlockState::Ready,
                     effective_len: 64,
                 }],

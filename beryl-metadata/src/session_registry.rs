@@ -56,8 +56,8 @@ pub struct WriteSession {
     pending_allocate_block: Option<PendingAllocateBlock>,
     /// Exact local publication currently freezing the issued-target sequence.
     active_publication: Option<WritePublicationId>,
-    /// Pins GC, namespace exclusion, and capacity while a submitted Commit awaits Raft.
-    commit_submitted: bool,
+    /// Pins GC, namespace exclusion, and capacity while a submitted publication awaits Raft.
+    publication_submitted: bool,
     /// Immutable identity and response retained for exact CreateFile replay.
     create_replay: Option<ActiveCreateReplay>,
 }
@@ -77,9 +77,7 @@ pub(crate) struct BeginSessionInput {
     pub normalized_path: String,
     pub mount_id: MountId,
     pub inode_id: InodeId,
-    pub current_lease_epoch: Option<LeaseEpoch>,
-    pub base_size: u64,
-    pub generation: ContentGeneration,
+    pub current_lease_epoch: LeaseEpoch,
     pub mode: WriteMode,
     pub open_client_id: ClientId,
     pub layout: FileLayout,
@@ -155,8 +153,6 @@ struct OpeningSession {
     inode_id: InodeId,
     mount_id: MountId,
     proposed_lease_epoch: LeaseEpoch,
-    base_size: u64,
-    generation: ContentGeneration,
     mode: WriteMode,
     open_client_id: ClientId,
     layout: FileLayout,
@@ -188,10 +184,10 @@ impl WriteSessionEntry {
         }
     }
 
-    /// Submitted commits outlive their lease deadline until durable resolution.
+    /// Submitted publications outlive their lease deadline until durable resolution.
     fn retirement_at_ms(&self) -> u64 {
         match self {
-            Self::Active(session) if session.commit_submitted => u64::MAX,
+            Self::Active(session) if session.publication_submitted => u64::MAX,
             _ => self.expires_at_ms(),
         }
     }
@@ -312,14 +308,13 @@ pub(crate) struct WriteTargetReservation<'a> {
     layout: FileLayout,
     open_client_id: ClientId,
     file_offset: u64,
-    block_stamp: u64,
     armed: bool,
 }
 
 /// Exact leader-local ownership of a stable issued-target sequence.
 ///
 /// While this owner is alive, new AllocateBlock steps are rejected before block
-/// allocation. A submitted Commit transfers this owner to a completion task so
+/// allocation. A submitted publication transfers this owner to a completion task so
 /// RPC cancellation cannot expose unpublished blocks to GC. Expiry stays pinned
 /// until Raft finishes; only the matching publication can retire its session.
 #[must_use = "a submitted publication must survive until durable resolution"]
@@ -376,13 +371,13 @@ impl WritePublication {
         result
     }
 
-    /// Pin the exact live session before transferring ownership to the Commit task.
+    /// Pin the exact live session before transferring ownership to the publication task.
     pub(crate) fn mark_submitted(&mut self) -> Result<(), String> {
         if self.submitted {
             return Ok(());
         }
         if self.session.lease_epoch.checked_next().is_none() {
-            return Err("CommitFile write lease epoch exhausted".into());
+            return Err("file publication write lease epoch exhausted".into());
         }
         let mut state = self.registry.state.write();
         let session = SessionRegistry::active_session_mut(&mut state, self.session.inode_id)?;
@@ -390,11 +385,11 @@ impl WritePublication {
             || session.active_publication != Some(self.publication_id)
             || session.expires_at_ms <= current_time_ms()
         {
-            return Err("CommitFile session changed or expired before submission".into());
+            return Err("file publication session changed or expired before submission".into());
         }
         let previous = session.expires_at_ms;
         let ancestors = session.ancestor_inode_ids.clone();
-        session.commit_submitted = true;
+        session.publication_submitted = true;
         SessionRegistry::move_expiry_indexes(&mut state, self.session.inode_id, &ancestors, previous, u64::MAX);
         self.submitted = true;
         Ok(())
@@ -422,11 +417,6 @@ impl WriteTargetReservation<'_> {
     /// Return the file offset reserved for this logical AllocateBlock step.
     pub(crate) fn file_offset(&self) -> u64 {
         self.file_offset
-    }
-
-    /// Return the content generation stamp captured for this target attempt.
-    pub(crate) fn block_stamp(&self) -> u64 {
-        self.block_stamp
     }
 
     /// Atomically install a validated target in place of this pending slot.
@@ -525,10 +515,20 @@ impl WriteOpening<'_> {
     }
 
     /// Atomically convert the matching, non-expired opening into an active session.
-    pub(crate) fn activate(mut self, returned_lease_epoch: LeaseEpoch) -> Result<WriteSession, WriteOpeningError> {
-        let result =
-            self.registry
-                .activate_opening(self.inode_id, self.opening_id, returned_lease_epoch, current_time_ms());
+    pub(crate) fn activate(
+        mut self,
+        returned_lease_epoch: LeaseEpoch,
+        file: &crate::inode::FileData,
+        tail: Option<LocatedBlock>,
+    ) -> Result<WriteSession, WriteOpeningError> {
+        let result = self.registry.activate_opening(
+            self.inode_id,
+            self.opening_id,
+            returned_lease_epoch,
+            current_time_ms(),
+            file,
+            tail,
+        );
         if result.is_ok() || matches!(&result, Err(WriteOpeningError::NotCurrent | WriteOpeningError::Expired)) {
             self.armed = false;
         }
@@ -571,6 +571,8 @@ impl CreateOpening<'_> {
 /// Exact reason why an opening cannot become an active session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteOpeningError {
+    /// Opening an existing tail requires one slot in the bounded target registry.
+    TargetLimit,
     /// The opening expired before the Raft result could be installed.
     Expired,
     /// Cleanup or replacement removed the exact opening identity.
@@ -862,7 +864,6 @@ impl SessionRegistry {
 
         let proposed_lease_epoch = input
             .current_lease_epoch
-            .unwrap_or_default()
             .checked_next()
             .ok_or(BeginSessionError::LeaseEpochExhausted)?;
         let opening_id = WriteOpeningId(state.next_opening_id);
@@ -877,8 +878,6 @@ impl SessionRegistry {
             inode_id,
             mount_id: input.mount_id,
             proposed_lease_epoch,
-            base_size: input.base_size,
-            generation: input.generation,
             mode: input.mode,
             open_client_id: input.open_client_id,
             layout: input.layout,
@@ -904,6 +903,8 @@ impl SessionRegistry {
         opening_id: WriteOpeningId,
         returned_lease_epoch: LeaseEpoch,
         now_ms: u64,
+        file: &crate::inode::FileData,
+        tail: Option<LocatedBlock>,
     ) -> Result<WriteSession, WriteOpeningError> {
         let mut state = self.state.write();
         let opening = match state.entries.get(&inode_id) {
@@ -921,22 +922,29 @@ impl SessionRegistry {
             });
         }
 
+        if file.lease_epoch != returned_lease_epoch || file.layout != opening.layout {
+            return Err(WriteOpeningError::NotCurrent);
+        }
+        if tail.is_some() && state.outstanding_write_targets >= self.max_write_targets {
+            return Err(WriteOpeningError::TargetLimit);
+        }
+        state.outstanding_write_targets += usize::from(tail.is_some());
         let session = WriteSession {
             inode_id: opening.inode_id,
             mount_id: opening.mount_id,
             lease_epoch: opening.proposed_lease_epoch,
-            base_size: opening.base_size,
-            generation: opening.generation,
+            base_size: file.len,
+            generation: file.generation,
             mode: opening.mode,
             open_client_id: opening.open_client_id,
             layout: opening.layout,
             expires_at_ms: opening.expires_at_ms,
             ancestor_inode_ids: opening.ancestor_inode_ids,
-            issued_targets: Vec::new(),
+            issued_targets: tail.into_iter().collect(),
             issued_steps: HashMap::new(),
             pending_allocate_block: None,
             active_publication: None,
-            commit_submitted: false,
+            publication_submitted: false,
             create_replay: None,
         };
         let previous = state
@@ -1008,7 +1016,7 @@ impl SessionRegistry {
             issued_steps: HashMap::new(),
             pending_allocate_block: None,
             active_publication: None,
-            commit_submitted: false,
+            publication_submitted: false,
             create_replay: Some(ActiveCreateReplay {
                 operation_id,
                 request_deadline_ms: removed.request_deadline_ms,
@@ -1041,7 +1049,7 @@ impl SessionRegistry {
         Self::retire_expired_entry_for_inode(&mut state, inode_id, now_ms);
         Self::retire_expired_entries(&mut state, now_ms);
         let pending = PendingAllocateBlock { previous_block_id };
-        let (layout, open_client_id, file_offset, block_stamp) = {
+        let (layout, open_client_id, file_offset) = {
             let session = Self::active_session_mut(&mut state, inode_id).map_err(BeginAllocateBlockError::Session)?;
             if session.lease_epoch != lease_epoch {
                 return Err(BeginAllocateBlockError::Session(
@@ -1070,10 +1078,6 @@ impl SessionRegistry {
             }
             let file_offset =
                 Self::next_target_file_offset(session).map_err(BeginAllocateBlockError::InvalidArgument)?;
-            let block_stamp = session
-                .generation
-                .checked_next()
-                .ok_or_else(|| BeginAllocateBlockError::InvalidArgument("content generation overflow".to_string()))?;
             if session.issued_targets.len() >= self.max_write_targets_per_session {
                 observe::record_write_target_rejected(WriteTargetLimit::PerSession.label());
                 return Err(BeginAllocateBlockError::LimitExceeded(WriteTargetLimitExceeded {
@@ -1081,7 +1085,7 @@ impl SessionRegistry {
                     maximum: self.max_write_targets_per_session,
                 }));
             }
-            (session.layout, session.open_client_id, file_offset, block_stamp)
+            (session.layout, session.open_client_id, file_offset)
         };
 
         if state.outstanding_write_targets >= self.max_write_targets {
@@ -1112,7 +1116,6 @@ impl SessionRegistry {
             layout,
             open_client_id,
             file_offset,
-            block_stamp: block_stamp.as_raw(),
             armed: true,
         }))
     }
@@ -1247,15 +1250,8 @@ impl SessionRegistry {
         if target_shape != expected_shape {
             return Err("write target shape does not match the session layout".to_string());
         }
-        let expected_block_stamp = session
-            .generation
-            .checked_next()
-            .ok_or_else(|| "content generation overflow".to_string())?;
-        if target.block_stamp != expected_block_stamp.as_raw() {
-            return Err(format!(
-                "write target block stamp changed: expected {expected_block_stamp}, got {}",
-                target.block_stamp
-            ));
+        if target.write_offset != 0 {
+            return Err("new block must start at offset zero".into());
         }
         Ok(())
     }
@@ -1268,17 +1264,18 @@ impl SessionRegistry {
     /// next offset by its full authorized capacity.
     fn next_target_file_offset(session: &WriteSession) -> Result<u64, String> {
         let Some(last) = session.issued_targets.last() else {
-            return Ok(session.base_size);
+            return Ok(if session.mode == WriteMode::Overwrite {
+                0
+            } else {
+                session.base_size
+            });
         };
-        if last.file_offset < session.base_size {
-            return Ok(session.base_size);
-        }
         last.file_offset
             .checked_add(last.block_size)
             .ok_or_else(|| "write target file offset overflow".to_string())
     }
 
-    /// Get a live session or a submitted Commit retained for resource protection.
+    /// Get a live session or a submitted publication retained for resource protection.
     /// Callers must validate the actual lease deadline before admitting new work.
     pub fn get_session(&self, inode_id: InodeId) -> Option<WriteSession> {
         let mut state = self.state.write();
@@ -1390,7 +1387,7 @@ impl SessionRegistry {
                 (
                     session.ancestor_inode_ids.clone(),
                     session.expires_at_ms,
-                    session.commit_submitted,
+                    session.publication_submitted,
                 )
             }
             Some(WriteSessionEntry::Opening(_)) | None => return Err(WriteSessionError::NotFound),
@@ -1430,7 +1427,7 @@ impl SessionRegistry {
     ///
     /// This does not walk namespace descendants. A bounded sweep may leave
     /// physically stale entries, but the maximum mirrored expiry prevents them
-    /// from producing a false `EBUSY`. Submitted commits deliberately retain
+    /// from producing a false `EBUSY`. Submitted publications deliberately retain
     /// exclusion until publication or fencing has a durable result.
     pub fn has_active_write_under(&self, inode_id: InodeId) -> bool {
         self.has_active_write_under_at(inode_id, current_time_ms())
@@ -1533,7 +1530,8 @@ impl SessionRegistry {
                     session.base_size
                 ));
             }
-            session.active_publication = None;
+            session.mode = WriteMode::Append;
+            Self::release_sync_publication(&mut state, inode_id);
             return Ok(());
         }
         let expected_generation = session
@@ -1559,13 +1557,27 @@ impl SessionRegistry {
             .retain(|_, target_index| *target_index < retained_target_count);
         session.generation = generation;
         session.base_size = file_size;
+        session.mode = WriteMode::Append;
         session.active_publication = None;
         state.outstanding_write_targets = state
             .outstanding_write_targets
             .checked_sub(removed_target_count)
             .expect("discarded issued targets must be included in global occupancy");
+        Self::release_sync_publication(&mut state, inode_id);
         Self::record_write_target_gauges(&state);
         Ok(())
+    }
+
+    /// Restore ordinary lease expiry only after the visible prefix is durable.
+    fn release_sync_publication(state: &mut SessionRegistryState, inode_id: InodeId) {
+        let session = Self::active_session_mut(state, inode_id).expect("publication owns the session");
+        session.active_publication = None;
+        if session.publication_submitted {
+            session.publication_submitted = false;
+            let expires_at_ms = session.expires_at_ms;
+            let ancestors = session.ancestor_inode_ids.clone();
+            Self::move_expiry_indexes(state, inode_id, &ancestors, u64::MAX, expires_at_ms);
+        }
     }
 
     /// Remove the active session only when the successful CommitFile still owns it.
@@ -2043,6 +2055,7 @@ mod tests {
     fn write_target(inode_id: InodeId, index: u32) -> LocatedBlock {
         let block_id = BlockId::new(inode_id, BlockIndex::new(index));
         LocatedBlock {
+            write_offset: 0,
             block_id,
             file_offset: 0,
             block_size: 64,
@@ -2052,7 +2065,7 @@ mod tests {
                 owner: ClientId::new(1),
                 epoch: LeaseEpoch::new(7),
             },
-            block_stamp: 1,
+
             chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
             block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             tier: Tier::Hdd,
@@ -2064,13 +2077,27 @@ mod tests {
             normalized_path: format!("/inode-{}", inode_id.as_raw()),
             inode_id,
             mount_id: MountId::new(1),
-            current_lease_epoch: Some(LeaseEpoch::new(6)),
-            base_size: 0,
-            generation: ContentGeneration::new(0),
+            current_lease_epoch: LeaseEpoch::new(6),
             mode: WriteMode::Overwrite,
             open_client_id: ClientId::new(1),
             layout: FileLayout::new(64),
             ancestor_inode_ids: vec![inode_id],
+        }
+    }
+
+    fn opened_file(opening: &WriteOpening<'_>) -> crate::inode::FileData {
+        let state = opening.registry.state.read();
+        let Some(WriteSessionEntry::Opening(entry)) = state.entries.get(&opening.inode_id) else {
+            panic!("opening fixture")
+        };
+        crate::inode::FileData {
+            layout: entry.layout,
+            len: 0,
+            generation: ContentGeneration::default(),
+            blocks: Vec::new(),
+            next_index: 0,
+            lease_epoch: entry.proposed_lease_epoch,
+            last_commit: None,
         }
     }
 
@@ -2079,8 +2106,9 @@ mod tests {
             .begin_session(input)
             .map_err(|error| format!("write session opening failed: {error:?}"))?;
         let lease_epoch = opening.proposed_lease_epoch();
+        let file = opened_file(&opening);
         opening
-            .activate(lease_epoch)
+            .activate(lease_epoch, &file, None)
             .map_err(|error| format!("write session activation failed: {error:?}"))
     }
 
@@ -2097,6 +2125,8 @@ mod tests {
             opening.opening_id,
             opening.proposed_lease_epoch,
             now_ms,
+            &opened_file(&opening),
+            None,
         );
         if result.is_ok() || matches!(&result, Err(WriteOpeningError::NotCurrent | WriteOpeningError::Expired)) {
             opening.armed = false;
@@ -2133,11 +2163,9 @@ mod tests {
         previous_block_id: Option<BlockId>,
         index: u32,
         file_offset: u64,
-        block_stamp: u64,
     ) -> LocatedBlock {
         let mut target = write_target(inode_id, index);
         target.file_offset = file_offset;
-        target.block_stamp = block_stamp;
         let reservation = match registry
             .begin_allocate_block(inode_id, LeaseEpoch::new(7), previous_block_id)
             .unwrap()
@@ -2170,6 +2198,8 @@ mod tests {
                 replacement.opening_id,
                 replacement.proposed_lease_epoch,
                 1,
+                &opened_file(&replacement),
+                None,
             )
             .unwrap();
         replacement.armed = false;
@@ -2371,7 +2401,7 @@ mod tests {
         install_session(&registry, create_input(inode_id)).unwrap();
         registry.remove_session_if_epoch(inode_id, LeaseEpoch::new(7)).unwrap();
         let mut replacement = create_input(inode_id);
-        replacement.current_lease_epoch = Some(LeaseEpoch::new(7));
+        replacement.current_lease_epoch = LeaseEpoch::new(7);
         install_session(&registry, replacement).unwrap();
 
         assert!(registry.remove_session_if_epoch(inode_id, LeaseEpoch::new(7)).is_none());
@@ -2486,7 +2516,7 @@ mod tests {
         let registry = Arc::new(SessionRegistry::default());
         let inode_id = InodeId::new(16);
         install_session(&registry, create_input(inode_id)).unwrap();
-        let first = issue_target(&registry, inode_id, None, 0, 0, 1);
+        let first = issue_target(&registry, inode_id, None, 0, 0);
         let reservation = match registry
             .begin_allocate_block(inode_id, LeaseEpoch::new(7), Some(first.block_id))
             .unwrap()
@@ -2509,9 +2539,8 @@ mod tests {
         ));
         drop(publication);
 
-        let second = issue_target(&registry, inode_id, Some(first.block_id), 1, 64, 1);
+        let second = issue_target(&registry, inode_id, Some(first.block_id), 1, 64);
         assert_eq!(second.file_offset, 64);
-        assert_eq!(second.block_stamp, 1);
         assert_eq!(registry.state.read().outstanding_write_targets, 2);
         assert_eq!(registry.state.read().pending_write_targets, 0);
 
@@ -2528,7 +2557,7 @@ mod tests {
                 Err(BeginAllocateBlockError::InvalidArgument(_))
             ));
         }
-        let replacement = issue_target(&registry, inode_id, Some(first.block_id), 2, 64, 2);
+        let replacement = issue_target(&registry, inode_id, Some(first.block_id), 2, 64);
         for (previous, expected) in [(None, first.clone()), (Some(first.block_id), replacement)] {
             assert!(matches!(
                 registry.begin_allocate_block(inode_id, LeaseEpoch::new(7), previous),
@@ -2560,10 +2589,39 @@ mod tests {
         let old = registry.begin_publication(inode_id, LeaseEpoch::new(7)).unwrap();
         registry.remove_session_if_epoch(inode_id, LeaseEpoch::new(7)).unwrap();
         let mut input = create_input(inode_id);
-        input.current_lease_epoch = Some(LeaseEpoch::new(7));
+        input.current_lease_epoch = LeaseEpoch::new(7);
         install_session(&registry, input).unwrap();
         old.complete_commit();
         assert_eq!(registry.get_session(inode_id).unwrap().lease_epoch, LeaseEpoch::new(8));
+    }
+
+    #[test]
+    fn submitted_sync_releases_expiry_pin_after_apply_or_exact_replay() {
+        for changes_content in [false, true] {
+            let registry = Arc::new(SessionRegistry::default());
+            let inode_id = InodeId::new(16);
+            install_session(&registry, create_input(inode_id)).unwrap();
+            let mut publication = registry.begin_publication(inode_id, LeaseEpoch::new(7)).unwrap();
+            publication.mark_submitted().unwrap();
+            let expired_at = publication.session().expires_at_ms + 1;
+            assert!(registry.has_active_write_under_at(inode_id, expired_at));
+            registry
+                .complete_sync_publication(
+                    inode_id,
+                    LeaseEpoch::new(7),
+                    publication.publication_id,
+                    ContentGeneration::new(u64::from(changes_content)),
+                    if changes_content { 64 } else { 0 },
+                    expired_at,
+                )
+                .unwrap();
+            drop(publication);
+            assert!(!registry.has_active_write_under_at(inode_id, expired_at));
+            let state = registry.state.read();
+            assert!(state.entries.is_empty());
+            assert!(state.entries_by_expiry.is_empty());
+            assert!(state.ancestor_activity.is_empty());
+        }
     }
 
     #[test]
@@ -2576,7 +2634,7 @@ mod tests {
             install_session(&registry, create_input(inode_id)).unwrap();
         }
 
-        let first = issue_target(&registry, first_inode, None, 0, 0, 1);
+        let first = issue_target(&registry, first_inode, None, 0, 0);
         assert!(matches!(
             registry.begin_allocate_block(first_inode, LeaseEpoch::new(7), Some(first.block_id)),
             Err(BeginAllocateBlockError::LimitExceeded(WriteTargetLimitExceeded {
@@ -2584,7 +2642,7 @@ mod tests {
                 maximum: 1,
             }))
         ));
-        issue_target(&registry, second_inode, None, 0, 0, 1);
+        issue_target(&registry, second_inode, None, 0, 0);
         assert!(matches!(
             registry.begin_allocate_block(third_inode, LeaseEpoch::new(7), None),
             Err(BeginAllocateBlockError::LimitExceeded(WriteTargetLimitExceeded {

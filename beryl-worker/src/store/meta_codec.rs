@@ -20,8 +20,7 @@ use super::block::{
 use crate::error::WorkerError;
 
 pub(super) fn encode_meta_payload(meta: &BlockMetaPayload) -> StoreResult<Vec<u8>> {
-    let proto = meta_to_proto(meta)?;
-    encode_proto_payload(proto)
+    Ok(meta_to_proto(meta)?.encode_to_vec())
 }
 
 pub(super) fn decode_meta_payload(encoded: &[u8]) -> StoreResult<BlockMetaPayload> {
@@ -29,36 +28,7 @@ pub(super) fn decode_meta_payload(encoded: &[u8]) -> StoreResult<BlockMetaPayloa
     meta_from_proto(proto)
 }
 
-pub(super) fn encode_staging_meta_payload(meta: &BlockMetaPayload) -> StoreResult<Vec<u8>> {
-    let proto = staging_meta_to_proto(meta)?;
-    encode_proto_payload(proto)
-}
-
-pub(super) fn decode_staging_meta_payload(encoded: &[u8]) -> StoreResult<BlockMetaPayload> {
-    let proto = BlockMetaPayloadProto::decode(encoded).map_err(|err| corrupt(err.to_string()))?;
-    staging_meta_from_proto(proto)
-}
-
 fn meta_to_proto(meta: &BlockMetaPayload) -> StoreResult<BlockMetaPayloadProto> {
-    let mut proto = meta_to_proto_without_visibility(meta)?;
-    proto.visibility = Some(BlockVisibilityProto {
-        block_state: block_state_to_proto(meta.visibility.block_state)? as i32,
-        block_stamp: meta.visibility.block_stamp,
-    });
-    Ok(proto)
-}
-
-fn staging_meta_to_proto(meta: &BlockMetaPayload) -> StoreResult<BlockMetaPayloadProto> {
-    if meta.visibility.block_state != BlockState::Loading {
-        return Err(WorkerError::InvalidArgument(
-            "published block state is not valid staging metadata".to_string(),
-        ));
-    }
-
-    meta_to_proto_without_visibility(meta)
-}
-
-fn meta_to_proto_without_visibility(meta: &BlockMetaPayload) -> StoreResult<BlockMetaPayloadProto> {
     let chunk_size = u32::try_from(meta.format.chunk_size)
         .map_err(|_| WorkerError::InvalidArgument("chunk size does not fit block metadata format".to_string()))?;
 
@@ -73,9 +43,12 @@ fn meta_to_proto_without_visibility(meta: &BlockMetaPayload) -> StoreResult<Bloc
             chunk_size,
         }),
         source: Some(BlockSourceProto {
-            effective_len: meta.source.effective_len,
+            durable_len: meta.source.durable_len,
         }),
-        visibility: None,
+        visibility: Some(BlockVisibilityProto {
+            block_state: block_state_to_proto(meta.visibility.block_state) as i32,
+            fencing_token: Some(meta.visibility.fencing_token.into()),
+        }),
         tier: TierProto::from(meta.tier) as i32,
     })
 }
@@ -88,59 +61,6 @@ fn meta_from_proto(proto: BlockMetaPayloadProto) -> StoreResult<BlockMetaPayload
         visibility,
         tier,
     } = proto;
-    let fields = meta_fields_from_proto(identity, format, source)?;
-    let visibility = visibility.ok_or_else(|| corrupt("block meta payload missing visibility"))?;
-    let tier = parse_known_tier(tier).map_err(|err| corrupt(format!("block meta payload invalid tier: {err}")))?;
-
-    Ok(BlockMetaPayload {
-        identity: fields.identity,
-        format: fields.format,
-        source: fields.source,
-        visibility: BlockVisibility {
-            block_state: block_state_from_proto(visibility.block_state)?,
-            block_stamp: visibility.block_stamp,
-        },
-        tier,
-    })
-}
-
-fn staging_meta_from_proto(proto: BlockMetaPayloadProto) -> StoreResult<BlockMetaPayload> {
-    let BlockMetaPayloadProto {
-        identity,
-        format,
-        source,
-        visibility,
-        tier,
-    } = proto;
-    if visibility.is_some() {
-        return Err(corrupt("staging block metadata must not encode final visibility"));
-    }
-
-    let fields = meta_fields_from_proto(identity, format, source)?;
-    let tier = parse_known_tier(tier).map_err(|err| corrupt(format!("block meta payload invalid tier: {err}")))?;
-    Ok(BlockMetaPayload {
-        identity: fields.identity,
-        format: fields.format,
-        source: fields.source,
-        visibility: BlockVisibility {
-            block_state: BlockState::Loading,
-            block_stamp: 0,
-        },
-        tier,
-    })
-}
-
-struct MetaFields {
-    identity: BlockIdentity,
-    format: BlockFormat,
-    source: BlockSource,
-}
-
-fn meta_fields_from_proto(
-    identity: Option<BlockIdentityProto>,
-    format: Option<BlockFormatProto>,
-    source: Option<BlockSourceProto>,
-) -> StoreResult<MetaFields> {
     let identity = identity.ok_or_else(|| corrupt("block meta payload missing identity"))?;
     let block_id = identity
         .block_id
@@ -150,7 +70,15 @@ fn meta_fields_from_proto(
     let format = format.ok_or_else(|| corrupt("block meta payload missing format"))?;
     let source = source.ok_or_else(|| corrupt("block meta payload missing source"))?;
 
-    Ok(MetaFields {
+    let visibility = visibility.ok_or_else(|| corrupt("block meta payload missing visibility"))?;
+    let tier = parse_known_tier(tier).map_err(|err| corrupt(format!("block meta payload invalid tier: {err}")))?;
+    Ok(BlockMetaPayload {
+        visibility: BlockVisibility {
+            block_state: block_state_from_proto(visibility.block_state)?,
+            fencing_token: beryl_proto::convert::required_fencing_token(visibility.fencing_token, "block writer token")
+                .map_err(corrupt)?,
+        },
+        tier,
         identity: BlockIdentity {
             block_id: BlockId::try_from(block_id)
                 .map_err(|error| corrupt(format!("block meta payload invalid block id: {error}")))?,
@@ -164,35 +92,26 @@ fn meta_fields_from_proto(
             checksum_kind: ChecksumKind::None,
         },
         source: BlockSource {
-            effective_len: source.effective_len,
+            durable_len: source.durable_len,
         },
     })
 }
 
-fn block_state_to_proto(block_state: BlockState) -> StoreResult<BlockStateProto> {
+fn block_state_to_proto(block_state: BlockState) -> BlockStateProto {
     match block_state {
-        BlockState::Loading => Err(WorkerError::InvalidArgument(
-            "loading block metadata is not valid final metadata".to_string(),
-        )),
-        BlockState::Ready => Ok(BlockStateProto::BlockStateReady),
-        BlockState::Corrupt => Ok(BlockStateProto::BlockStateCorrupt),
+        BlockState::Deleting => BlockStateProto::BlockStateDeleting,
+        BlockState::Ready => BlockStateProto::BlockStateReady,
+        BlockState::Corrupt => BlockStateProto::BlockStateCorrupt,
     }
 }
 
 fn block_state_from_proto(block_state: i32) -> StoreResult<BlockState> {
     match BlockStateProto::try_from(block_state).map_err(|_| corrupt("unsupported block state"))? {
         BlockStateProto::BlockStateUnspecified => Err(corrupt("block state must be specified")),
+        BlockStateProto::BlockStateDeleting => Ok(BlockState::Deleting),
         BlockStateProto::BlockStateReady => Ok(BlockState::Ready),
         BlockStateProto::BlockStateCorrupt => Ok(BlockState::Corrupt),
     }
-}
-
-fn encode_proto_payload(proto: BlockMetaPayloadProto) -> StoreResult<Vec<u8>> {
-    let mut encoded = Vec::with_capacity(proto.encoded_len());
-    proto
-        .encode(&mut encoded)
-        .map_err(|err| WorkerError::Internal(err.to_string()))?;
-    Ok(encoded)
 }
 
 fn corrupt(message: impl Into<String>) -> WorkerError {

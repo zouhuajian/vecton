@@ -861,7 +861,12 @@ fn start_worker_instance(
         Arc::clone(&block_store),
         Arc::clone(&worker_core),
     )?);
-    let worker_server = WorkerServiceInstance::start(listener, worker_core, Arc::clone(&registration_state));
+    let worker_server = WorkerServiceInstance::start(
+        listener,
+        worker_core,
+        Arc::clone(&registration_state),
+        worker_config.metadata.clone(),
+    );
     Ok(StartedWorkerService {
         worker_id,
         registrar,

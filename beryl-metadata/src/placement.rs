@@ -27,7 +27,7 @@ pub struct PlacementRequest {
     pub group_name: GroupName,
     pub op: PlacementOp,
     pub block_id: BlockId,
-    pub block_stamp: Option<u64>,
+    pub visible_len: u64,
     pub layout: FileLayout,
     pub caller: Option<CallerContextFields>,
     pub existing: Vec<ReportedBlockLocation>,
@@ -37,9 +37,10 @@ pub struct PlacementRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReportedBlockLocation {
+    pub tier: Tier,
     pub group_name: GroupName,
     pub block_id: BlockId,
-    pub block_stamp: u64,
+    pub durable_len: u64,
     pub worker_id: WorkerId,
     pub worker_run_id: WorkerRunId,
 }
@@ -155,10 +156,7 @@ fn choose_read(req: &PlacementRequest, workers: &[WorkerPlacementView]) -> Place
     for location in &req.existing {
         if location.group_name != req.group_name
             || location.block_id != req.block_id
-            || req
-                .block_stamp
-                .map(|block_stamp| block_stamp != location.block_stamp)
-                .unwrap_or(false)
+            || location.durable_len < req.visible_len
             || !seen.insert(location.worker_id)
         {
             continue;

@@ -28,6 +28,7 @@ pub(crate) struct WriteSession {
     flush_cursor: u64,
     expires_at_ms: Option<u64>,
     ready_blocks: Vec<ReadyBlock>,
+    write_group: Option<beryl_types::GroupName>,
     state: WriteSessionState,
     sync: Option<SyncWriteState>,
     commit: Option<CommitFileState>,
@@ -63,10 +64,11 @@ impl WriteSession {
             mode,
             write_handle,
             base_size,
-            cursor: base_size,
-            flush_cursor: base_size,
+            cursor: if mode == WriteMode::Overwrite { 0 } else { base_size },
+            flush_cursor: if mode == WriteMode::Overwrite { 0 } else { base_size },
             expires_at_ms: Some(expires_at_ms),
             ready_blocks: Vec::new(),
+            write_group: None,
             state: WriteSessionState::Open,
             sync: None,
             commit: None,
@@ -109,7 +111,7 @@ impl WriteSession {
     /// Validate a metadata write target before opening the worker stream.
     pub(crate) fn validate_target(&mut self, target: &LocatedBlock) -> ClientResult<()> {
         self.ensure_open_for_write()?;
-        if target.file_offset != self.flush_cursor {
+        if target.file_offset.checked_add(target.write_offset) != Some(self.flush_cursor) {
             return Err(ClientError::invalid_layout(format!(
                 "write target file_offset mismatch: expected {}, got {}",
                 self.flush_cursor, target.file_offset
@@ -150,28 +152,98 @@ impl WriteSession {
                 self.inode_id.as_raw()
             )));
         }
-        if target.block_stamp == 0 {
+        if target.write_offset >= target.block_size || target.fencing_token.epoch != self.write_handle.lease_epoch {
             return Err(ClientError::invalid_layout(
-                "write target block_stamp must be non-zero".to_string(),
+                "write target offset or writer epoch is invalid".to_string(),
             ));
         }
         Ok(())
     }
 
-    /// Records a durable Worker Ready block pending Metadata publication.
+    /// Binds the returned tail to the opened file and its validated Metadata group.
+    pub(crate) fn accept_open_tail(
+        &mut self,
+        group: beryl_types::GroupName,
+        tail: Option<LocatedBlock>,
+    ) -> ClientResult<()> {
+        let needs_tail =
+            self.mode == WriteMode::Append && !self.base_size.is_multiple_of(u64::from(self.layout.block_size));
+        if needs_tail != tail.is_some() {
+            return Err(ClientError::invalid_layout("OpenWrite tail does not match file length"));
+        }
+        self.record_write_group(group)?;
+        if let Some(target) = tail {
+            self.validate_target(&target)?;
+            self.ready_blocks.push(ReadyBlock {
+                written_len: target.write_offset,
+                target,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_write_group(&mut self, group: beryl_types::GroupName) -> ClientResult<()> {
+        if self.write_group.as_ref().is_some_and(|current| current != &group) {
+            return Err(ClientError::invalid_layout("write target changed Metadata group"));
+        }
+        self.write_group = Some(group);
+        Ok(())
+    }
+
+    /// Reuses the most recent partial checkpoint; it is not another allocation step.
+    pub(crate) fn reusable_tail(&self) -> Option<(beryl_types::GroupName, LocatedBlock)> {
+        let last = self.ready_blocks.last()?;
+        if last.written_len >= last.target.block_size {
+            return None;
+        }
+        let mut target = last.target.clone();
+        target.write_offset = last.written_len;
+        Some((self.write_group.clone()?, target))
+    }
+
+    /// Records a total durable block length and advances only by this stream's appended bytes.
     pub(crate) fn push_ready_block(&mut self, target: LocatedBlock, written_len: u64) -> ClientResult<()> {
-        let final_offset = self
-            .flush_cursor
+        if written_len < target.write_offset
+            || written_len > target.block_size
+            || target.file_offset.checked_add(target.write_offset) != Some(self.flush_cursor)
+        {
+            return Err(ClientError::invalid_layout(
+                "Worker checkpoint does not match the flush cursor",
+            ));
+        }
+        let final_offset = target
+            .file_offset
             .checked_add(written_len)
-            .ok_or_else(|| ClientError::invalid_argument("write flush cursor overflow".to_string()))?;
+            .ok_or_else(|| ClientError::invalid_argument("write flush cursor overflow"))?;
+        if final_offset != self.cursor {
+            return Err(ClientError::invalid_layout(
+                "Worker checkpoint does not match accepted bytes",
+            ));
+        }
+        if self
+            .ready_blocks
+            .last()
+            .is_some_and(|last| last.target.block_id == target.block_id)
+        {
+            self.ready_blocks.pop();
+        }
         self.ready_blocks.push(ReadyBlock { target, written_len });
         self.flush_cursor = final_offset;
         Ok(())
     }
 
-    /// Returns durable Worker blocks that may be published by Metadata.
-    pub(crate) fn ready_blocks(&self) -> &[ReadyBlock] {
-        &self.ready_blocks
+    /// Return only the tail growth and new blocks beyond the last publication.
+    pub(crate) fn publication_blocks(&self) -> Vec<CommittedBlock> {
+        self.ready_blocks
+            .iter()
+            .filter(|block| {
+                self.mode == WriteMode::Overwrite || block.target.file_offset + block.written_len > self.base_size
+            })
+            .map(|block| CommittedBlock {
+                block_id: block.target.block_id,
+                len: block.written_len,
+            })
+            .collect()
     }
 
     /// Freezes one SyncWrite identity and payload before Metadata can observe it.
@@ -182,13 +254,10 @@ impl WriteSession {
         &mut self,
         client_id: ClientId,
         client_name: &str,
-        mut committed_blocks: Vec<CommittedBlock>,
+        committed_blocks: Vec<CommittedBlock>,
         target_size: u64,
         deadline: OperationDeadline,
     ) -> ClientResult<SyncWritePlan> {
-        if self.mode == WriteMode::Append {
-            committed_blocks.retain(|block| block.file_offset >= self.base_size);
-        }
         match self.state {
             WriteSessionState::Open => {
                 self.sync = Some(SyncWriteState {
@@ -252,13 +321,10 @@ impl WriteSession {
         &mut self,
         client_id: ClientId,
         client_name: &str,
-        mut committed_blocks: Vec<CommittedBlock>,
+        committed_blocks: Vec<CommittedBlock>,
         final_size: u64,
         deadline: OperationDeadline,
     ) -> ClientResult<CommitFilePlan> {
-        if self.mode == WriteMode::Append {
-            committed_blocks.retain(|block| block.file_offset >= self.base_size);
-        }
         match self.state {
             WriteSessionState::Open => {
                 self.commit = Some(CommitFileState {
@@ -399,6 +465,7 @@ impl WriteSession {
         }
         self.generation = generation;
         self.base_size = file_size;
+        self.mode = WriteMode::Append;
         self.sync = None;
         self.state = WriteSessionState::Open;
         Ok(())
@@ -555,18 +622,6 @@ pub(crate) struct ReadyBlock {
     written_len: u64,
 }
 
-impl ReadyBlock {
-    /// Metadata write target for this block.
-    pub(crate) fn target(&self) -> &LocatedBlock {
-        &self.target
-    }
-
-    /// Durable effective length established by the Worker.
-    pub(crate) fn written_len(&self) -> u64 {
-        self.written_len
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WriteSessionState {
     Open,
@@ -693,7 +748,7 @@ mod tests {
             session.prepare_commit_file(
                 ClientId::new(7),
                 "test-client",
-                vec![committed_block(302, 0, 0, len)],
+                vec![committed_block(302, 0, len)],
                 len,
                 OperationDeadline::new(1_000),
             )
@@ -712,14 +767,14 @@ mod tests {
         assert_eq!(first.write_handle, retry.write_handle);
         assert_eq!(first.expected_generation, retry.expected_generation);
         assert_eq!(retry.final_size, 5);
-        assert_eq!(retry.committed_blocks, vec![committed_block(302, 0, 0, 5)]);
+        assert_eq!(retry.committed_blocks, vec![committed_block(302, 0, 5)]);
 
         let mut sync_session = new_session(2_000);
         let prepare_sync = |session: &mut WriteSession| {
             session.prepare_sync_write(
                 ClientId::new(7),
                 "test-client",
-                vec![committed_block(302, 0, 0, 5)],
+                vec![committed_block(302, 0, 5)],
                 5,
                 OperationDeadline::new(1_000),
             )
@@ -829,10 +884,9 @@ mod tests {
         }
     }
 
-    fn committed_block(inode_id: u64, block_index: u32, file_offset: u64, len: u64) -> CommittedBlock {
+    fn committed_block(inode_id: u64, block_index: u32, len: u64) -> CommittedBlock {
         CommittedBlock {
             block_id: BlockId::new(InodeId::new(inode_id), BlockIndex::new(block_index)),
-            file_offset,
             len,
         }
     }

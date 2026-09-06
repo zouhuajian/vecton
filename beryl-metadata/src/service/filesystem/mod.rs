@@ -32,7 +32,7 @@ use tokio::sync::RwLock;
 pub(super) use namespace::{CreateDirectoryArgs, CreateFileArgs, DeleteArgs, RenameArgs};
 pub(super) use publish::{CommitFileArgs, SyncWriteArgs};
 pub(super) use read::{BlockLocationsTarget, GetBlockLocationsArgs, GetStatusArgs, ListStatusArgs, OpenFileArgs};
-pub(super) use write::{AbortFileWriteArgs, AllocateBlockArgs, OpenWriteArgs, RenewLeaseArgs};
+pub(super) use write::{AbortFileWriteArgs, AllocateBlockArgs, AuthorizeBlockWriteArgs, OpenWriteArgs, RenewLeaseArgs};
 
 /// The supported runtime authorizes exactly one worker for each block.
 const SUPPORTED_REPLICA_COUNT: u8 = 1;
@@ -414,7 +414,8 @@ mod tests {
     use crate::config::FileLayoutDefaults;
     pub(super) use crate::config::RaftConfig;
     pub(super) use crate::inode::Inode;
-    use crate::inode::InodeData;
+    pub(super) use crate::inode::InodeAttrs;
+    use crate::inode::InodeKind;
     pub(super) use crate::mount::{DataIoPolicy, MountEntry, MountKind, ROOT_INODE_ID};
     use crate::raft::PublishMode;
     pub(super) use crate::raft::{AppRaftNode, AppRaftStateMachine, RocksDBStorage};
@@ -427,7 +428,6 @@ mod tests {
         ErrorKind, InternalErrorKind, MetadataErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail, WorkerErrorKind,
     };
     pub(super) use beryl_common::header::RequestHeader;
-    pub(super) use beryl_types::fs::FileAttrs;
     pub(super) use beryl_types::ids::{BlockId, BlockIndex, ClientId, InodeId, MountId, WorkerId};
     pub(super) use beryl_types::layout::FileLayout;
     pub(super) use beryl_types::lease::FencingToken;
@@ -699,34 +699,36 @@ mod tests {
     }
 
     pub(super) fn report_block(block_id: BlockId) -> BlockReportBlock {
-        report_block_with_stamp(block_id, u64::from(block_id.index.as_raw()) + 1)
+        report_block_with_epoch(block_id, 1)
     }
 
-    pub(super) fn report_block_with_stamp(block_id: BlockId, block_stamp: u64) -> BlockReportBlock {
-        report_block_with_stamp_and_len(block_id, block_stamp, 64)
+    pub(super) fn report_block_with_epoch(block_id: BlockId, lease_epoch: u64) -> BlockReportBlock {
+        report_block_with_epoch_and_len(block_id, lease_epoch, 64)
     }
 
-    pub(super) fn report_block_with_stamp_and_len(
+    pub(super) fn report_block_with_epoch_and_len(
         block_id: BlockId,
-        block_stamp: u64,
+        lease_epoch: u64,
         effective_len: u64,
     ) -> BlockReportBlock {
         BlockReportBlock {
+            tier: Some(beryl_types::Tier::Hdd),
             block_id,
-            block_stamp,
+            lease_epoch,
             block_state: BlockReportBlockState::Ready,
             effective_len,
         }
     }
 
-    pub(super) fn report_block_with_stamp_and_state(
+    pub(super) fn report_block_with_epoch_and_state(
         block_id: BlockId,
-        block_stamp: u64,
+        lease_epoch: u64,
         block_state: BlockReportBlockState,
     ) -> BlockReportBlock {
         BlockReportBlock {
+            tier: Some(beryl_types::Tier::Hdd),
             block_id,
-            block_stamp,
+            lease_epoch,
             block_state,
             effective_len: if block_state == BlockReportBlockState::Ready {
                 64
@@ -736,12 +738,12 @@ mod tests {
         }
     }
 
-    pub(super) fn publish_report_locations_with_stamp(
+    pub(super) fn publish_report_locations_with_epoch(
         manager: &WorkerManager,
         group_name: &GroupName,
         worker_id: WorkerId,
         report_seq: u64,
-        block_stamp: Option<u64>,
+        lease_epoch: Option<u64>,
         blocks: Vec<BlockId>,
     ) {
         let run_id = manager
@@ -759,8 +761,8 @@ mod tests {
                 blocks
                     .into_iter()
                     .map(|block_id| {
-                        block_stamp
-                            .map(|stamp| report_block_with_stamp(block_id, stamp))
+                        lease_epoch
+                            .map(|epoch| report_block_with_epoch(block_id, epoch))
                             .unwrap_or_else(|| report_block(block_id))
                     })
                     .collect(),
@@ -838,6 +840,7 @@ mod tests {
         let lease_epoch = LeaseEpoch::new(1);
         let block_id = BlockId::new(inode_id, BlockIndex::new(0));
         let target = LocatedBlock {
+            write_offset: 0,
             block_id,
             file_offset: 0,
             block_size: 64,
@@ -847,7 +850,7 @@ mod tests {
                 owner: writer,
                 epoch: lease_epoch,
             },
-            block_stamp: 1,
+
             chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
             block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             tier: Tier::Hdd,
@@ -858,16 +861,23 @@ mod tests {
                 normalized_path: "/file".to_string(),
                 inode_id,
                 mount_id,
-                current_lease_epoch: Some(LeaseEpoch::new(0)),
-                base_size: 0,
-                generation: ContentGeneration::new(0),
+                current_lease_epoch: LeaseEpoch::new(0),
                 mode: WriteMode::Overwrite,
                 open_client_id: writer,
                 layout: FileLayout::new(64),
                 ancestor_inode_ids,
             })
             .expect("session capacity");
-        opening.activate(lease_epoch).expect("session created");
+        let file = crate::inode::FileData {
+            layout: FileLayout::new(64),
+            len: 0,
+            generation: ContentGeneration::default(),
+            blocks: Vec::new(),
+            next_index: 0,
+            lease_epoch,
+            last_commit: None,
+        };
+        opening.activate(lease_epoch, &file, None).expect("session created");
         let target_reservation = match session_registry
             .begin_allocate_block(inode_id, lease_epoch, None)
             .expect("target capacity")
@@ -878,12 +888,8 @@ mod tests {
         target_reservation.complete(target).expect("target installed");
     }
 
-    pub(super) fn committed_block(block_id: BlockId, file_offset: u64, len: u64) -> CommittedBlock {
-        CommittedBlock {
-            block_id,
-            file_offset,
-            len,
-        }
+    pub(super) fn committed_block(block_id: BlockId, len: u64) -> CommittedBlock {
+        CommittedBlock { block_id, len }
     }
 
     pub(super) async fn allocate_block_for_key(filesystem: &MetadataFileSystem, key: &OpenWriteOutput) -> LocatedBlock {
@@ -970,9 +976,17 @@ mod tests {
             .with_worker_manager(worker_manager(&group_name))
             .build();
 
-        let mut attrs = FileAttrs::new();
-        attrs.size = base_size;
-        storage.put_inode(&Inode::new_file(inode_id, attrs, mount_id)).unwrap();
+        let attrs = InodeAttrs::new();
+        let mut inode = Inode::new_file(inode_id, attrs, mount_id, beryl_types::FileLayout::new(4096));
+        let file = inode.file_mut().unwrap();
+        file.layout = FileLayout::new(64);
+        file.len = base_size;
+        let count = crate::inode::FileData::block_count(base_size, 64).unwrap();
+        file.blocks = (0..count)
+            .map(|index| BlockId::new(inode_id, beryl_types::BlockIndex::new(index as u32)))
+            .collect();
+        file.next_index = count as u64;
+        storage.put_inode(&inode).unwrap();
         storage.put_layout(inode_id, FileLayout::new(64)).unwrap();
 
         WriteFlowEnv {
@@ -1001,14 +1015,14 @@ mod tests {
             &env.group_name,
             worker.worker_id,
             report_seq,
-            report_block_with_stamp_and_len(target.block_id, target.block_stamp, effective_len),
+            report_block_with_epoch_and_len(target.block_id, target.fencing_token.epoch.as_raw(), effective_len),
         );
     }
 
-    pub(super) fn stored_generation(storage: &RocksDBStorage, inode_id: InodeId) -> Option<ContentGeneration> {
+    pub(super) fn stored_generation(storage: &RocksDBStorage, inode_id: InodeId) -> ContentGeneration {
         let inode = storage.get_inode(inode_id).unwrap().expect("test inode should exist");
-        match inode.data {
-            InodeData::File { generation, .. } => generation,
+        match inode.kind {
+            InodeKind::File(crate::inode::FileData { generation, .. }) => generation,
             other => panic!("unexpected inode data: {:?}", other),
         }
     }

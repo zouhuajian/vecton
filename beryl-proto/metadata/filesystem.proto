@@ -35,28 +35,6 @@ enum FileTypeProto {
   FILE_TYPE_UNSPECIFIED = 0;
   FILE_TYPE_FILE = 1;
   FILE_TYPE_DIR = 2;
-  FILE_TYPE_SYMLINK = 3;
-}
-
-/// File attributes (metadata for inodes).
-/// All timestamps are in milliseconds since Unix epoch.
-message FileAttrsProto {
-  /// File mode (permissions + type bits).
-  uint32 mode = 1;
-  /// User ID.
-  uint32 uid = 2;
-  /// Group ID.
-  uint32 gid = 3;
-  /// File size in bytes.
-  uint64 size = 4;
-  /// Access time (milliseconds since Unix epoch).
-  uint64 atime_ms = 5;
-  /// Modification time (milliseconds since Unix epoch).
-  uint64 mtime_ms = 6;
-  /// Change time (milliseconds since Unix epoch).
-  uint64 ctime_ms = 7;
-  /// Number of hard links.
-  uint32 nlink = 8;
 }
 
 /// Directory entry metadata visible through listing APIs.
@@ -65,8 +43,10 @@ message DirEntryProto {
   string name = 1;
   /// Required inode kind for the child status.
   FileTypeProto kind = 2;
-  /// Required attributes for the child status returned by ListStatus.
-  optional FileAttrsProto attrs = 3;
+  uint64 len = 3;
+  // Milliseconds since Unix epoch.
+  uint64 create_time = 4;
+  uint64 modify_time = 5;
 }
 
 // Identifies a file write lease. Both fields must be non-zero; Metadata checks
@@ -90,9 +70,7 @@ message LocatedBlockProto {
   uint64 block_size = 4;
   // Metadata-selected chunk size for the worker-local block format.
   uint32 chunk_size = 5;
-  // Metadata-assigned stamp that the worker must persist when publishing this
-  // block and future direct readers must present back to the worker.
-  uint64 block_stamp = 6;
+  uint64 write_offset = 6;
   repeated common.WorkerEndpointInfoProto worker_endpoints = 7;
   common.FencingTokenProto fencing_token = 8;
   // Worker-local storage tier requested for this block replica.
@@ -101,8 +79,8 @@ message LocatedBlockProto {
 
 message CommittedBlockProto {
   common.BlockIdProto block_id = 1;
-  uint64 file_offset = 2;
-  uint64 len = 3;
+  // Total block length, including the previously visible tail prefix.
+  uint64 len = 2;
 }
 
 message FileBlockLocationProto {
@@ -112,15 +90,12 @@ message FileBlockLocationProto {
   // Metadata-issued read candidates. Empty means FileLayout has this block
   // range but no live reported replica is currently eligible.
   repeated common.WorkerEndpointInfoProto workers = 4;
-  // Metadata-authoritative logical block_stamp for this block version.
-  // Normal readable locations must carry a non-zero value.
-  optional uint64 block_stamp = 5;
   // FileLayout-derived block format facts that workers validate before reads.
-  uint32 block_format_id = 6;
-  uint64 block_size = 7;
-  uint32 chunk_size = 8;
+  uint32 block_format_id = 5;
+  uint64 block_size = 6;
+  uint32 chunk_size = 7;
   // Block-local readable prefix expected by metadata for this block.
-  uint64 effective_len = 9;
+  uint64 effective_len = 8;
 }
 
 // ============================================================================
@@ -134,10 +109,12 @@ message GetStatusRequestProto {
 
 message GetStatusResponseProto {
   common.ResponseHeaderProto header = 1;
-  // Required user-visible attributes for a successful response.
-  FileAttrsProto attrs = 2;
+  uint64 len = 2;
+  // Milliseconds since Unix epoch.
+  uint64 create_time = 3;
+  uint64 modify_time = 4;
   // Required namespace kind. UNSPECIFIED is not a successful domain value.
-  FileTypeProto kind = 3;
+  FileTypeProto kind = 5;
 }
 
 message ListStatusRequestProto {
@@ -166,13 +143,14 @@ message ListStatusResponseProto {
 message CreateDirectoryRequestProto {
   common.RequestHeaderProto header = 1;
   string path = 2;
-  FileAttrsProto attrs = 3;
-  bool recursive = 4;
+  bool recursive = 3;
 }
 
 message CreateDirectoryResponseProto {
   common.ResponseHeaderProto header = 1;
-  FileAttrsProto attrs = 2;
+  // Milliseconds since Unix epoch.
+  uint64 create_time = 2;
+  uint64 modify_time = 3;
 }
 
 message DeleteOptionsProto {
@@ -276,6 +254,8 @@ message OpenWriteResponseProto {
   common.FileLayoutProto layout = 5;
   // Durable content generation used as the publish CAS precondition.
   uint64 generation = 6;
+  // Existing partial tail, authorized for this newly acquired writer.
+  LocatedBlockProto tail_block = 7;
 }
 
 message AllocateBlockRequestProto {
@@ -362,7 +342,26 @@ message MsyncResponseProto {
   common.GroupStateWatermarkProto state = 2;
 }
 
+// A Worker checks current write authority once before each data stream.
+message AuthorizeBlockWriteRequestProto {
+  common.RequestHeaderProto header = 1;
+  string group_name = 2;
+  uint64 worker_id = 3;
+  string worker_run_id = 4;
+  common.FencingTokenProto fencing_token = 5;
+  uint64 write_offset = 6;
+  uint64 block_size = 7;
+  uint32 block_format_id = 8;
+  uint32 chunk_size = 9;
+  common.TierProto tier = 10;
+}
+message AuthorizeBlockWriteResponseProto {
+  common.ResponseHeaderProto header = 1;
+  uint64 visible_len = 2;
+}
+
 service FileSystemServiceProto {
+  rpc AuthorizeBlockWrite(AuthorizeBlockWriteRequestProto) returns (AuthorizeBlockWriteResponseProto);
   // namespace
   rpc GetStatus(GetStatusRequestProto) returns (GetStatusResponseProto);
   rpc ListStatus(ListStatusRequestProto) returns (ListStatusResponseProto);

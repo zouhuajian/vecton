@@ -32,27 +32,22 @@ message ReadBlockRequestProto {
   // not relative to the file.
   common.ByteRangeProto byte_range = 3;
 
-  // Metadata-issued logical block stamp for direct read validation.
-  // Must be non-zero. Worker validation rejects zero, stale, or mismatched
-  // block stamps.
-  uint64 block_stamp = 4;
-
   // Client-preferred transport frame payload size in bytes.
   // The worker may clamp it to its configured maximum.
   // This is not the worker-local StorageChunk size.
-  uint32 frame_size = 5;
+  uint32 frame_size = 4;
 
   // Metadata-confirmed worker process-run identity for the selected endpoint.
-  string worker_run_id = 6;
+  string worker_run_id = 5;
 
   // Metadata-issued expected block layout facts from the authoritative FileLayout.
-  uint32 block_format_id = 7;
-  uint64 block_size = 8;
-  uint32 chunk_size = 9;
-  uint64 effective_len = 10;
+  uint32 block_format_id = 6;
+  uint64 block_size = 7;
+  uint32 chunk_size = 8;
+  uint64 effective_len = 9;
 
   // Stable metadata group name for the local block-store lookup.
-  string group_name = 11;
+  string group_name = 10;
 }
 
 // One ordered payload from a ReadBlock response stream. Normal stream
@@ -72,8 +67,9 @@ message WriteBlockCommandProto {
   uint32 block_format_id = 5;
   uint64 block_size = 6;
   uint32 chunk_size = 7;
-  uint64 block_stamp = 8;
-  common.TierProto tier = 9;
+  common.FencingTokenProto fencing_token = 8;
+  uint64 write_offset = 9;
+  common.TierProto tier = 10;
 }
 
 // One ordered request payload. The first payload must be command and every
@@ -86,8 +82,8 @@ message WriteBlockRequestProto {
   }
 }
 
-// Sent exactly once after validation and staging creation. Normal response
-// stream completion means the complete block was durably published as Ready.
+// Sent exactly once after validation and block-open checkpoint. Normal response
+// stream completion means the stream prefix was durably checkpointed.
 message WriteBlockResponseProto {
 }
 

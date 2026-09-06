@@ -92,7 +92,6 @@ message HeartbeatResponseProto {
 /// Requests deletion of one exact worker-local Ready block.
 message BlockCleanupCommandProto {
   common.BlockIdProto block_id = 1;
-  uint64 expected_block_stamp = 2;
 }
 
 // ============================================================================
@@ -110,11 +109,13 @@ enum ReportedBlockStateProto {
 /// Current worker-local state for one block. Chunk bitmaps and range routing are out of scope.
 message ReportedBlockProto {
   common.BlockIdProto block_id = 1;
-  uint64 block_stamp = 2;
-  ReportedBlockStateProto state = 3;
+  // Persisted writer epoch that owns this durable checkpoint.
+  uint64 lease_epoch = 2;
+  common.TierProto tier = 3;
+  ReportedBlockStateProto state = 4;
   // Worker-persisted valid length for this exact local block version.
-  // Ready entries must carry a non-zero value; Deleting entries may use zero.
-  uint64 effective_len = 4;
+  // Zero is a recoverable empty checkpoint or a transient Deleting observation.
+  uint64 effective_len = 5;
 }
 
 /// One block entry in a Delta Block Report.

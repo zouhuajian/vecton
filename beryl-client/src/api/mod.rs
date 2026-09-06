@@ -11,7 +11,7 @@ mod reader;
 mod status;
 mod writer;
 
-pub use beryl_types::{FileAttrs, FileType};
+pub use beryl_types::FileType;
 pub use client::FsClient;
 pub use list_status::ListStatusIterator;
 pub use options::{DeleteOptions, ListStatusOptions, MkdirOptions};

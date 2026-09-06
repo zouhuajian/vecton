@@ -35,7 +35,7 @@ pub(super) struct GrpcWorkerTransport {
     channel_pool: Arc<GrpcWorkerChannelPool>,
 }
 
-/// Cancels a request whose open future exits before the staging Ack can
+/// Cancels a request whose open future exits before the block-open acknowledgement can
 /// transfer request-stream ownership to `BlockWrite`.
 struct OpeningWriteCancellation {
     signal: Option<Sender<bool>>,
@@ -115,7 +115,7 @@ impl GrpcWorkerTransport {
     }
 
     /// Opens one block RPC and returns its concrete client-side owner after the
-    /// Worker acknowledges staging creation.
+    /// Worker acknowledges block-open checkpoint.
     ///
     /// The RPC intentionally has no fixed tonic timeout after the acknowledgement:
     /// later `write_all`, sync, and close calls apply their own local deadlines,
@@ -157,7 +157,7 @@ impl GrpcWorkerTransport {
             Ok(Some(_)) => {}
             Ok(None) => {
                 return Err(ClientError::unknown_outcome(
-                    "worker WriteBlock ended before staging acknowledgement".to_string(),
+                    "worker WriteBlock ended before block-open acknowledgement".to_string(),
                 )
                 .with_operation_context(attempt.operation_context()));
             }
@@ -269,12 +269,12 @@ async fn next_write_block_request(
 }
 
 /// Builds a terminal missing-payload request. Worker already rejects this
-/// shape through its owned failure path, which aborts staging without Ready.
+/// shape through its owned failure path, which discards bytes beyond the last durable checkpoint.
 fn write_block_failure_cleanup_request() -> WriteBlockRequestProto {
     WriteBlockRequestProto { payload: None }
 }
 
-/// Waits for the sole terminal response condition after the staging Ack.
+/// Waits for the sole terminal response condition after the block-open acknowledgement.
 /// Normal EOF means Worker Ready; every other outcome leaves publication
 /// unproven and is returned to the owning `FileWriter`.
 async fn wait_for_write_completion(
@@ -342,7 +342,6 @@ fn is_stale_read_location_error(error: &ClientError) -> bool {
             && matches!(
                 rpc_error.kind,
                 ErrorKind::Worker(WorkerErrorKind::BlockLocationUnavailable)
-                    | ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch)
                     | ErrorKind::Worker(WorkerErrorKind::RunMismatch)
                     | ErrorKind::Metadata(MetadataErrorKind::StaleState)
                     | ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch)
@@ -363,8 +362,8 @@ impl WorkerTransport for GrpcWorkerTransport {
     ) -> ClientResult<()> {
         if block_read.workers.is_empty() {
             return Err(block_location_unavailable_error(format!(
-                "block location unavailable: no worker candidates for block {} file_offset={} len={} block_stamp={}",
-                block_read.block_id, block_read.file_offset, block_read.len, block_read.block_stamp
+                "block location unavailable: no worker candidates for block {} file_offset={} len={}",
+                block_read.block_id, block_read.file_offset, block_read.len
             )));
         }
         let mut last_transport_error = None;
@@ -412,8 +411,8 @@ impl WorkerTransport for GrpcWorkerTransport {
         }
         Err(last_location_error.unwrap_or_else(|| {
             block_location_unavailable_error(format!(
-                "block location unavailable: no reachable worker candidates for block {} file_offset={} len={} block_stamp={}",
-                block_read.block_id, block_read.file_offset, block_read.len, block_read.block_stamp
+                "block location unavailable: no reachable worker candidates for block {} file_offset={} len={}",
+                block_read.block_id, block_read.file_offset, block_read.len
             ))
         }))
     }
@@ -728,7 +727,7 @@ mod tests {
             end_file_offset: 4,
             block_id: block_id(),
             block_offset: 0,
-            block_stamp: 77,
+
             block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
             block_size: 4096,
             chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
@@ -742,12 +741,13 @@ mod tests {
         WorkerWriteTarget {
             group_name: group_name(),
             target: LocatedBlock {
+                write_offset: 0,
                 block_id,
                 file_offset: 0,
                 block_size: 4096,
                 worker_endpoints: workers,
                 fencing_token: FencingToken::new(block_id, ClientId::new(7), LeaseEpoch::new(1)),
-                block_stamp: 77,
+
                 chunk_size: BlockFormatId::CURRENT_FOR_NEW_FILE.spec().unwrap().storage_chunk_size,
                 block_format_id: BlockFormatId::CURRENT_FOR_NEW_FILE,
                 tier: Tier::Mem,
@@ -837,7 +837,7 @@ mod tests {
                 lease_expiry(),
             )
             .await
-            .expect("staging acknowledgement");
+            .expect("block-open acknowledgement");
         let error = match block.write(Bytes::from_static(b"data")).await {
             Ok(()) => block
                 .finish()
@@ -918,7 +918,7 @@ mod tests {
                 lease_expiry_after(200),
             )
             .await
-            .expect("staging acknowledgement");
+            .expect("block-open acknowledgement");
 
         block.write(Bytes::from_static(b"a")).await.expect("first frame");
         block

@@ -9,7 +9,7 @@ use crate::observe;
 use crate::raft::{ApplySuccess, Command};
 use crate::session_registry::WritePublication;
 use beryl_types::ids::{BlockId, InodeId, MountId};
-use beryl_types::{GroupName, LeaseEpoch};
+use beryl_types::{ContentGeneration, GroupName, LeaseEpoch};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::debug;
@@ -173,26 +173,31 @@ impl MetadataFileSystem {
         }
     }
 
-    /// Finish one admitted Commit even if the RPC waiter is cancelled.
-    /// The pinned session bounds these tasks and protects Ready blocks until apply.
-    pub(super) async fn propose_file_commit(
+    /// Keep submitted visibility changes alive independently of the RPC waiter.
+    ///
+    /// The session pins unpublished blocks and namespace exclusion until apply
+    /// finishes or an ordered lease fence rules out a delayed publication.
+    pub(super) async fn propose_file_publication(
         &self,
         command: Command,
-        publication: WritePublication,
-    ) -> MetadataResult<()> {
-        let Command::CommitFile {
-            inode_id,
-            publication: ref payload,
-            ..
-        } = command
-        else {
-            unreachable!("CommitFile command required")
+        mut publication: WritePublication,
+    ) -> MetadataResult<ContentGeneration> {
+        let (inode_id, lease_epoch, file_size, closes) = match &command {
+            Command::CommitFile {
+                inode_id, publication, ..
+            } => (*inode_id, publication.lease_epoch, publication.target_size, true),
+            Command::PublishFile {
+                inode_id, publication, ..
+            } => (*inode_id, publication.lease_epoch, publication.target_size, false),
+            _ => unreachable!("file publication command required"),
         };
-        let ended_epoch = payload.lease_epoch.checked_next();
+        publication.mark_submitted().map_err(MetadataError::Again)?;
+        let ended_epoch = lease_epoch.checked_next();
+        let operation_name = command.operation_name();
         let fence = self.propose_write_command(Command::EndWriteLease {
             proposed_at_ms: crate::raft::proposal_timestamp_ms(),
             inode_id,
-            lease_epoch: payload.lease_epoch,
+            lease_epoch,
         });
         let proposal = self.propose_write_command(command);
         tokio::spawn(async move {
@@ -201,29 +206,47 @@ impl MetadataFileSystem {
                 Ok(ApplySuccess::FileCommitted {
                     inode_id: returned,
                     lease_epoch,
-                    ..
-                }) if returned == inode_id && Some(lease_epoch) == ended_epoch => Ok(()),
-                Ok(unexpected) => Err(unexpected_raft_apply_success("CommitFile", unexpected)),
+                    generation,
+                }) if closes && returned == inode_id && Some(lease_epoch) == ended_epoch => Ok(generation),
+                Ok(ApplySuccess::FilePublished {
+                    inode_id: returned,
+                    generation,
+                }) if !closes && returned == inode_id => Ok(generation),
+                Ok(unexpected) => Err(unexpected_raft_apply_success(operation_name, unexpected)),
                 Err(error) => Err(error),
             };
-            // An error can leave apply queued in the Raft state-machine worker.
-            // One ordered fence proves that no older Commit can still publish.
-            // If authority is unavailable, Drop retains the bounded pin until restart.
-            let resolved = result.is_ok()
-                || matches!(fence.await,
-                Ok(ApplySuccess::WriteLeaseEnded { inode_id: returned, lease_epoch })
-                    if returned == inode_id && Some(lease_epoch) >= ended_epoch);
-            if resolved {
-                publication.complete_commit();
-            }
-            record_fs_write_result("commit_file", started, &result);
+            let result = match result {
+                Ok(generation) => {
+                    if closes {
+                        publication.complete_commit();
+                        Ok(generation)
+                    } else {
+                        publication
+                            .complete_sync(generation, file_size)
+                            .map(|()| generation)
+                            .map_err(MetadataError::Internal)
+                    }
+                }
+                Err(error) => {
+                    // Transport or apply-worker failure may leave the mutation
+                    // queued. Only ordered authority may release its GC pin.
+                    if matches!(fence.await,
+                        Ok(ApplySuccess::WriteLeaseEnded { inode_id: returned, lease_epoch })
+                            if returned == inode_id && Some(lease_epoch) >= ended_epoch)
+                    {
+                        publication.complete_commit();
+                    }
+                    Err(error)
+                }
+            };
+            record_fs_write_result(operation_name, started, &result);
             result
         })
         .await
-        .map_err(|error| MetadataError::Internal(format!("CommitFile completion task failed: {error}")))?
+        .map_err(|error| MetadataError::Internal(format!("file publication task failed: {error}")))?
     }
 
-    /// Own the proposal dependencies so a submitted close can outlive its RPC waiter.
+    /// Own the proposal dependencies so submitted publication can outlive its RPC waiter.
     fn propose_write_command(
         &self,
         command: Command,

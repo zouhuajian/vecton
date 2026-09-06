@@ -13,7 +13,7 @@ use beryl_common::error::{CommonError, CommonErrorKind};
 use beryl_common::grpc_server::MAX_GRPC_CONCURRENT_REQUESTS;
 use beryl_common::observe::config::{LogConfig, ResourceConfig};
 use beryl_common::observe::ObservabilityConfig;
-use beryl_types::{FileLayout, GroupName, MAX_FILE_EXTENTS};
+use beryl_types::{FileLayout, GroupName, MAX_FILE_BLOCKS};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
@@ -309,7 +309,7 @@ impl Default for MetadataWriteTargetLimitsConfig {
     fn default() -> Self {
         Self {
             max_outstanding: 65_536,
-            max_outstanding_per_session: MAX_FILE_EXTENTS,
+            max_outstanding_per_session: MAX_FILE_BLOCKS,
         }
     }
 }
@@ -610,7 +610,7 @@ fn validate_write_session_limits(config: &MetadataWriteSessionLimitsConfig) -> R
     Ok(())
 }
 
-/// Preserves the relationship between global, per-session, and file extent limits.
+/// Preserves the relationship between global, per-session, and file block limits.
 fn validate_write_target_limits(config: &MetadataWriteTargetLimitsConfig) -> Result<(), CommonError> {
     if config.max_outstanding_per_session > config.max_outstanding {
         return Err(invalid_config(
@@ -618,10 +618,10 @@ fn validate_write_target_limits(config: &MetadataWriteTargetLimitsConfig) -> Res
             "must not exceed the global write-target maximum",
         ));
     }
-    if config.max_outstanding_per_session > MAX_FILE_EXTENTS {
+    if config.max_outstanding_per_session > MAX_FILE_BLOCKS {
         return Err(invalid_config(
             WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION,
-            "must not exceed the compiled file extent maximum",
+            "must not exceed the compiled file block maximum",
         ));
     }
     Ok(())
@@ -741,7 +741,7 @@ mod tests {
         let mut flat = base_flat();
         flat.set(
             WRITE_TARGET_MAX_OUTSTANDING_PER_SESSION,
-            i64::try_from(MAX_FILE_EXTENTS + 1).unwrap(),
+            i64::try_from(MAX_FILE_BLOCKS + 1).unwrap(),
         );
         assert!(MetadataConfig::from_flat(flat).is_err());
 

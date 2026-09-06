@@ -6,18 +6,17 @@
 use crate::error::WorkerError;
 use crate::observe;
 use crate::report::BlockReportChangeTracker;
-use crate::runtime::block::{BlockManager, ReadPin, ReclaimingBlock};
+use crate::runtime::block::{BlockManager, BlockPin, ReclaimingBlock};
 use crate::runtime::write::{BlockWriteIoGuard, BlockWriteKey, BlockWriteRegistration, BlockWriteRegistry};
 use crate::runtime::DataRpcPermit;
 use crate::store::block::{
-    BlockMetaPayload, BlockState, ChecksumKind, CreateStagingBlockRequest, LocalBlockStore, PublishReadyRequest,
-    ReclaimBlockRequest, ReclaimBlockResult,
+    CheckpointBlockRequest, ChecksumKind, LocalBlockStore, OpenBlockWriteRequest, ReclaimBlockRequest,
+    ReclaimBlockResult,
 };
-use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, WorkerErrorKind};
 use beryl_types::chunk::ByteRange;
 use beryl_types::ids::BlockId;
 use beryl_types::layout::{BlockFormatId, BlockShape, BlockShapeError};
-use beryl_types::{GroupName, Tier, WorkerRunId};
+use beryl_types::{FencingToken, GroupName, Tier, WorkerRunId};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,7 +35,7 @@ pub(crate) struct ReadBlockRequest {
     pub(crate) block_id: BlockId,
     /// Block-local range; its offset is relative to `block_id`.
     pub(crate) byte_range: ByteRange,
-    pub(crate) block_stamp: u64,
+
     pub(crate) block_format_id: BlockFormatId,
     pub(crate) block_size: u64,
     pub(crate) chunk_size: u32,
@@ -55,7 +54,7 @@ pub(crate) struct ActiveBlockRead {
     next_offset: u64,
     end_offset: u64,
     frame_size: u32,
-    read_pin: ReadPin,
+    read_pin: BlockPin,
     rpc_permit: Arc<DataRpcPermit>,
 }
 
@@ -65,7 +64,8 @@ pub(crate) struct WriteBlockRequest {
     pub(crate) group_name: GroupName,
     pub(crate) block_id: BlockId,
     pub(crate) worker_run_id: WorkerRunId,
-    pub(crate) block_stamp: u64,
+    pub(crate) fencing_token: FencingToken,
+    pub(crate) write_offset: u64,
     pub(crate) block_size: u64,
     pub(crate) block_format_id: BlockFormatId,
     pub(crate) chunk_size: u32,
@@ -76,15 +76,26 @@ pub(crate) struct WriteBlockRequest {
 /// Mutable state owned by exactly one `WriteBlock` RPC.
 ///
 /// Ordered gRPC delivery makes `next_offset` the only progress state required;
-/// dropping this value schedules staging cleanup through its registration.
+/// dropping this value schedules write cleanup through its registration.
 pub(crate) struct ActiveBlockWrite {
     group_name: GroupName,
     block_id: BlockId,
     worker_run_id: WorkerRunId,
-    block_stamp: u64,
+    fencing_token: FencingToken,
     block_size: u64,
     next_offset: u64,
     registration: Option<BlockWriteRegistration>,
+}
+
+impl ActiveBlockWrite {
+    /// Waits for revocation even when the client sends no more request frames.
+    pub(crate) async fn retired(&self) {
+        self.registration
+            .as_ref()
+            .expect("active write owns its registration")
+            .retired()
+            .await;
+    }
 }
 
 /// Data-plane lifecycle boundary used by the gRPC service.
@@ -127,7 +138,7 @@ impl WorkerCore {
     ) -> WorkerCoreResult<ActiveBlockRead> {
         let frame_size = self.negotiate_read_frame_size(req.frame_size)?;
         self.block_manager.validate_read_request(&req)?;
-        let read_pin = self.block_manager.pin_read(&req.group_name, req.block_id)?;
+        let read_pin = self.block_manager.pin_block(&req.group_name, req.block_id)?;
         let validation_pin = read_pin.clone();
         let validation_rpc_permit = Arc::clone(&rpc_permit);
         let block_manager = Arc::clone(&self.block_manager);
@@ -156,7 +167,13 @@ impl WorkerCore {
         })
     }
 
-    /// Creates staging state and transfers the RPC permit to its cleanup-owned entry.
+    /// Pins pending online authorization so a delayed success cannot resurrect a reclaimed block.
+    pub(crate) fn pin_write_authorization(&self, req: &WriteBlockRequest) -> WorkerCoreResult<BlockPin> {
+        validate_write_block_request(req)?;
+        self.block_manager.pin_block(&req.group_name, req.block_id)
+    }
+
+    /// Creates write state and transfers the RPC permit to its cleanup-owned entry.
     ///
     /// Success is the first local side effect acknowledged to the client. Any
     /// later transport failure therefore has an unknown outcome at the client.
@@ -164,26 +181,38 @@ impl WorkerCore {
         &self,
         req: WriteBlockRequest,
         rpc_permit: DataRpcPermit,
+        block_pin: BlockPin,
+        visible_len: u64,
     ) -> WorkerCoreResult<ActiveBlockWrite> {
         validate_write_block_request(&req)?;
         let key = BlockWriteKey {
             group_name: req.group_name.clone(),
             block_id: req.block_id,
         };
-        let registration = self.block_writes.register(key, rpc_permit).ok_or_else(|| {
-            WorkerError::ResourceExhausted(format!(
-                "block already has an active write: group_name={}, block_id={}",
-                req.group_name, req.block_id
-            ))
-        })?;
+        let authorization_pin = block_pin.clone();
+        let registration = self
+            .block_writes
+            .register(key, rpc_permit, req.fencing_token, block_pin)
+            .await
+            .ok_or_else(|| {
+                WorkerError::ResourceExhausted(format!(
+                    "block already has an active write: group_name={}, block_id={}",
+                    req.group_name, req.block_id
+                ))
+            })?;
+
+        if authorization_pin.is_reclaiming() {
+            return Err(WorkerError::Unavailable(
+                "block reclamation started during write authorization".into(),
+            ));
+        }
 
         let block_store = Arc::clone(&self.block_store);
         let io_request = req.clone();
         let io_guard = begin_write_io(&registration)?;
         let create = tokio::task::spawn_blocking(move || {
             let _io_guard = io_guard;
-            reject_existing_final_block(block_store.as_ref(), &io_request)?;
-            block_store.create_staging_block(CreateStagingBlockRequest {
+            block_store.open_block_write(OpenBlockWriteRequest {
                 group_name: io_request.group_name,
                 block_id: io_request.block_id,
                 block_size: io_request.block_size,
@@ -191,10 +220,13 @@ impl WorkerCore {
                 chunk_size: io_request.chunk_size,
                 checksum_kind: io_request.checksum_kind,
                 tier: io_request.tier,
+                fencing_token: io_request.fencing_token,
+                write_offset: io_request.write_offset,
+                visible_len,
             })
         })
         .await
-        .map_err(|error| WorkerError::Internal(format!("block staging creation task failed: {error}")))?;
+        .map_err(|error| WorkerError::Internal(format!("block block-open checkpoint task failed: {error}")))?;
 
         if let Err(error) = create {
             let block_store = Arc::clone(&self.block_store);
@@ -203,10 +235,10 @@ impl WorkerCore {
             let io_guard = begin_write_io(&registration)?;
             let cleanup = tokio::task::spawn_blocking(move || {
                 let _io_guard = io_guard;
-                block_store.abort_staging_block(&group_name, block_id)
+                block_store.discard_unsynced_suffix(&group_name, block_id)
             })
             .await
-            .map_err(|join_error| WorkerError::Internal(format!("failed staging cleanup task failed: {join_error}")))?;
+            .map_err(|join_error| WorkerError::Internal(format!("failed write cleanup task failed: {join_error}")))?;
             if cleanup.is_ok() {
                 registration.complete();
             }
@@ -222,16 +254,16 @@ impl WorkerCore {
             block_id = %req.block_id,
             inode_id = req.block_id.inode_id.as_raw(),
             worker_run_id = %req.worker_run_id,
-            block_stamp = req.block_stamp,
+            lease_epoch = %req.fencing_token.epoch,
             "Block write accepted"
         );
         Ok(ActiveBlockWrite {
             group_name: req.group_name,
             block_id: req.block_id,
             worker_run_id: req.worker_run_id,
-            block_stamp: req.block_stamp,
+            fencing_token: req.fencing_token,
             block_size: req.block_size,
-            next_offset: 0,
+            next_offset: req.write_offset,
             registration: Some(registration),
         })
     }
@@ -302,15 +334,15 @@ impl WorkerCore {
         let group_name = write.group_name.clone();
         let block_id = write.block_id;
         let effective_len = write.next_offset;
-        let block_stamp = write.block_stamp;
+        let fencing_token = write.fencing_token;
         let io_guard = begin_active_write_io(write)?;
         let meta = tokio::task::spawn_blocking(move || {
             let _io_guard = io_guard;
-            block_store.publish_ready(PublishReadyRequest {
+            block_store.checkpoint_block(CheckpointBlockRequest {
                 group_name,
                 block_id,
                 effective_len,
-                block_stamp,
+                fencing_token,
             })
         })
         .await
@@ -325,8 +357,8 @@ impl WorkerCore {
             block_id = %write.block_id,
             inode_id = write.block_id.inode_id.as_raw(),
             worker_run_id = %write.worker_run_id,
-            block_stamp = meta.visibility.block_stamp,
-            committed_length = meta.source.effective_len,
+            lease_epoch = %meta.visibility.fencing_token.epoch,
+            committed_length = meta.source.durable_len,
             "Block write completed"
         );
         write
@@ -337,7 +369,7 @@ impl WorkerCore {
         Ok(())
     }
 
-    /// Releases one failed RPC's staging files before returning a protocol error.
+    /// Releases one failed RPC's uncheckpointed suffix before returning a protocol error.
     /// If cleanup itself fails, dropping the registration leaves it for retry.
     pub(crate) async fn abort_block_write(&self, mut write: ActiveBlockWrite) -> WorkerCoreResult<()> {
         let block_store = Arc::clone(&self.block_store);
@@ -346,7 +378,7 @@ impl WorkerCore {
         let io_guard = begin_active_write_io(&write)?;
         tokio::task::spawn_blocking(move || {
             let _io_guard = io_guard;
-            block_store.abort_staging_block(&group_name, block_id)
+            block_store.discard_unsynced_suffix(&group_name, block_id)
         })
         .await
         .map_err(|error| WorkerError::Internal(format!("block abort task failed: {error}")))??;
@@ -373,7 +405,7 @@ impl WorkerCore {
         }
     }
 
-    /// Drains all RPC-owned staging state until completion or process deadline.
+    /// Drains all RPC-owned write state until completion or process deadline.
     pub async fn drain_block_writes_until(&self, deadline: TokioInstant) -> bool {
         loop {
             if self.block_writes.active_count() == 0 {
@@ -411,13 +443,7 @@ impl WorkerCore {
             for candidate in candidates {
                 let group_name = candidate.key.group_name.clone();
                 let block_id = candidate.key.block_id;
-                let result = match block_store.abort_staging_block(&group_name, block_id) {
-                    Ok(()) => Ok(()),
-                    Err(abort_error) => match block_store.load_meta(&group_name, block_id) {
-                        Ok(meta) if meta.visibility.block_state == BlockState::Ready => Ok(()),
-                        _ => Err(abort_error),
-                    },
-                };
+                let result = block_store.discard_unsynced_suffix(&group_name, block_id);
                 match result {
                     Ok(()) => {
                         completed += usize::from(candidate.complete());
@@ -451,16 +477,22 @@ impl WorkerCore {
         }
     }
 
-    /// Reclaims one exact metadata-authorized Ready block version.
+    /// Reclaims one exact metadata-authorized block identity.
     pub async fn reclaim_block(&self, req: ReclaimBlockRequest) -> WorkerCoreResult<ReclaimBlockResult> {
-        self.block_store.inspect_reclaim_block(&req)?;
-        let permit = self
-            .block_manager
-            .begin_reclaim(&req.group_name, req.block_id, req.expected_block_stamp)
-            .await?;
-        let result = self.block_store.reclaim_block(&req)?;
-        permit.complete();
-        Ok(result)
+        let permit = self.block_manager.begin_reclaim(&req.group_name, req.block_id)?;
+        self.block_writes.retire(&BlockWriteKey {
+            group_name: req.group_name.clone(),
+            block_id: req.block_id,
+        });
+        permit.wait_for_pins().await;
+        let store = Arc::clone(&self.block_store);
+        tokio::task::spawn_blocking(move || {
+            let result = store.reclaim_block(&req)?;
+            permit.complete();
+            Ok(result)
+        })
+        .await
+        .map_err(|error| WorkerError::Internal(format!("block reclaim task failed: {error}")))?
     }
 
     pub(crate) fn reclaiming_blocks(&self, group_name: &GroupName) -> Vec<ReclaimingBlock> {
@@ -559,9 +591,13 @@ impl WorkerCore {
 }
 
 fn validate_write_block_request(req: &WriteBlockRequest) -> WorkerCoreResult<()> {
-    if req.block_stamp == 0 {
+    if req.fencing_token.block_id != req.block_id
+        || req.fencing_token.owner.is_zero()
+        || req.fencing_token.epoch.as_raw() == 0
+        || req.write_offset >= req.block_size
+    {
         return Err(WorkerError::InvalidArgument(
-            "block_stamp must be metadata-assigned and non-zero".to_string(),
+            "invalid block writer token or offset".into(),
         ));
     }
     validate_block_shape(
@@ -617,66 +653,15 @@ fn begin_active_write_io(write: &ActiveBlockWrite) -> WorkerCoreResult<BlockWrit
     )
 }
 
-fn reject_existing_final_block(
-    store: &(dyn LocalBlockStore + Send + Sync),
-    req: &WriteBlockRequest,
-) -> WorkerCoreResult<()> {
-    match store.load_meta(&req.group_name, req.block_id) {
-        Ok(meta) => {
-            validate_existing_block_shape(req, &meta)?;
-            match meta.visibility.block_state {
-                BlockState::Ready | BlockState::Corrupt => Err(WorkerError::RefreshMetadata {
-                    kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
-                    message: format!(
-                        "local block already has final metadata: group_name={}, block_id={}, state={:?}",
-                        req.group_name, req.block_id, meta.visibility.block_state
-                    ),
-                }),
-                BlockState::Loading => Err(WorkerError::Corrupt(
-                    "loading block metadata is not valid final metadata".to_string(),
-                )),
-            }
-        }
-        Err(WorkerError::NotFound(_)) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn validate_existing_block_shape(req: &WriteBlockRequest, meta: &BlockMetaPayload) -> WorkerCoreResult<()> {
-    if meta.visibility.block_stamp != req.block_stamp {
-        return Err(WorkerError::RefreshMetadata {
-            kind: ErrorKind::Worker(WorkerErrorKind::BlockStampMismatch),
-            message: format!(
-                "block stamp mismatch: group_name={}, block_id={}, requested={}, local={}",
-                req.group_name, req.block_id, req.block_stamp, meta.visibility.block_stamp
-            ),
-        });
-    }
-    if meta.format.format_id != req.block_format_id
-        || meta.format.block_size != req.block_size
-        || meta.format.chunk_size != u64::from(req.chunk_size)
-        || meta.tier != req.tier
-    {
-        return Err(WorkerError::RefreshMetadata {
-            kind: ErrorKind::Metadata(MetadataErrorKind::StaleState),
-            message: format!(
-                "block layout mismatch: group_name={}, block_id={}",
-                req.group_name, req.block_id
-            ),
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{ReadBlockRequest, WorkerCore, WriteBlockRequest};
     use crate::error::WorkerError;
     use crate::runtime::DataRpcPermit;
+    use crate::store::block::{BlockMetaPayload, BlockState};
     use crate::store::block::{
-        BlockMetaPayload, BlockState, ChecksumKind, CreateStagingBlockRequest, FullBlockFileStore,
-        FullBlockFileStoreConfig, LocalBlockStore, PublishReadyRequest, ReclaimBlockRequest, ReclaimBlockResult,
-        ReclaimBlockState, StoreResult,
+        CheckpointBlockRequest, ChecksumKind, FullBlockFileStore, FullBlockFileStoreConfig, LocalBlockStore,
+        OpenBlockWriteRequest, ReclaimBlockRequest, ReclaimBlockResult, ReclaimBlockState, StoreResult,
     };
     use beryl_common::error::rpc::{ErrorKind, WorkerErrorKind};
     use beryl_types::chunk::ByteRange;
@@ -693,10 +678,10 @@ mod tests {
     use tokio::time::Instant;
 
     const BLOCK_SIZE: u64 = 4096;
-    const BLOCK_STAMP: u64 = 55;
+    const LEASE_EPOCH: u64 = 55;
 
     fn chunk_size() -> u32 {
-        BlockFormatId::FULL_EFFECTIVE.spec().unwrap().storage_chunk_size
+        BlockFormatId::DURABLE_PREFIX.spec().unwrap().storage_chunk_size
     }
 
     fn group_name() -> GroupName {
@@ -712,9 +697,14 @@ mod tests {
             group_name: group_name(),
             block_id: block_id(),
             worker_run_id: WorkerRunId::new(),
-            block_stamp: BLOCK_STAMP,
+            fencing_token: beryl_types::FencingToken::new(
+                block_id(),
+                beryl_types::ClientId::new(9),
+                beryl_types::LeaseEpoch::new(LEASE_EPOCH),
+            ),
+            write_offset: 0,
             block_size: BLOCK_SIZE,
-            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+            block_format_id: BlockFormatId::DURABLE_PREFIX,
             chunk_size: chunk_size(),
             checksum_kind: ChecksumKind::None,
             tier: Tier::Hdd,
@@ -722,9 +712,20 @@ mod tests {
     }
 
     fn write_request_for(block_id: BlockId) -> WriteBlockRequest {
-        WriteBlockRequest {
-            block_id,
-            ..write_request()
+        let mut req = write_request();
+        req.block_id = block_id;
+        req.fencing_token.block_id = block_id;
+        req
+    }
+
+    impl WorkerCore {
+        async fn begin_test_write(
+            &self,
+            req: WriteBlockRequest,
+            permit: DataRpcPermit,
+        ) -> super::WorkerCoreResult<super::ActiveBlockWrite> {
+            let pin = self.pin_write_authorization(&req)?;
+            self.begin_block_write(req, permit, pin, 0).await
         }
     }
 
@@ -755,6 +756,7 @@ mod tests {
         Create,
         PanicFirstAbort,
         Publish,
+        Write,
         Read,
     }
 
@@ -784,18 +786,19 @@ mod tests {
     }
 
     impl LocalBlockStore for BlockingStore {
-        fn create_staging_block(&self, req: CreateStagingBlockRequest) -> StoreResult<BlockMetaPayload> {
+        fn open_block_write(&self, req: OpenBlockWriteRequest) -> StoreResult<BlockMetaPayload> {
             self.block_once(BlockingOperation::Create);
-            self.inner.create_staging_block(req)
+            self.inner.open_block_write(req)
         }
 
         fn write_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, data: Bytes) -> StoreResult<()> {
+            self.block_once(BlockingOperation::Write);
             self.inner.write_at(group_name, block_id, offset, data)
         }
 
-        fn publish_ready(&self, req: PublishReadyRequest) -> StoreResult<BlockMetaPayload> {
+        fn checkpoint_block(&self, req: CheckpointBlockRequest) -> StoreResult<BlockMetaPayload> {
             self.block_once(BlockingOperation::Publish);
-            self.inner.publish_ready(req)
+            self.inner.checkpoint_block(req)
         }
 
         fn read_at(&self, group_name: &GroupName, block_id: BlockId, offset: u64, len: u64) -> StoreResult<Bytes> {
@@ -815,13 +818,13 @@ mod tests {
             self.inner.reclaim_block(req)
         }
 
-        fn abort_staging_block(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
+        fn discard_unsynced_suffix(&self, group_name: &GroupName, block_id: BlockId) -> StoreResult<()> {
             let call = self.abort_calls.fetch_add(1, Ordering::SeqCst);
             if self.operation == BlockingOperation::PanicFirstAbort && call == 0 {
                 panic!("injected abort panic");
             }
             self.block_once(BlockingOperation::Abort);
-            self.inner.abort_staging_block(group_name, block_id)
+            self.inner.discard_unsynced_suffix(group_name, block_id)
         }
     }
 
@@ -865,8 +868,8 @@ mod tests {
             group_name: group_name(),
             block_id: block_id(),
             byte_range: ByteRange { offset: 0, len },
-            block_stamp: BLOCK_STAMP,
-            block_format_id: BlockFormatId::FULL_EFFECTIVE,
+
+            block_format_id: BlockFormatId::DURABLE_PREFIX,
             block_size: BLOCK_SIZE,
             chunk_size: chunk_size(),
             effective_len: 8,
@@ -878,7 +881,7 @@ mod tests {
     async fn failed_or_cancelled_write_is_cleaned_and_can_be_reused() {
         let (_temp, _store, core) = core_with_store();
         let mut write = core
-            .begin_block_write(write_request(), write_rpc_permit())
+            .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("begin write");
         core.write_block_data(&mut write, Bytes::from_static(b"partial"))
@@ -892,7 +895,7 @@ mod tests {
         );
 
         let reused = core
-            .begin_block_write(write_request(), write_rpc_permit())
+            .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse block");
         core.abort_block_write(reused).await.expect("abort reuse");
@@ -911,7 +914,7 @@ mod tests {
         let write_slots = Arc::new(Semaphore::new(1));
         let rpc_permit = rpc_permit(Arc::clone(&write_slots), "write");
         let task_core = Arc::clone(&core);
-        let write = tokio::spawn(async move { task_core.begin_block_write(write_request(), rpc_permit).await });
+        let write = tokio::spawn(async move { task_core.begin_test_write(write_request(), rpc_permit).await });
         tokio::task::spawn_blocking(move || started.recv().expect("blocking create started"))
             .await
             .expect("wait for create");
@@ -936,7 +939,7 @@ mod tests {
         );
         assert_eq!(write_slots.available_permits(), 1);
         let reused = core
-            .begin_block_write(write_request(), write_rpc_permit())
+            .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse after cleanup");
         core.abort_block_write(reused).await.expect("abort reused write");
@@ -953,7 +956,7 @@ mod tests {
             abort_calls: _abort_calls,
         } = blocking_core(BlockingOperation::Publish);
         let mut write = core
-            .begin_block_write(write_request(), write_rpc_permit())
+            .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("begin write");
         core.write_block_data(&mut write, Bytes::from_static(b"ready"))
@@ -995,7 +998,7 @@ mod tests {
             abort_calls,
         } = blocking_core(BlockingOperation::Abort);
         let write = core
-            .begin_block_write(write_request(), write_rpc_permit())
+            .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("begin write");
         drop(write);
@@ -1014,7 +1017,7 @@ mod tests {
             "a second cleanup pass must wait for the claimed abort"
         );
         assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
-        match core.begin_block_write(write_request(), write_rpc_permit()).await {
+        match core.begin_test_write(write_request(), write_rpc_permit()).await {
             Err(WorkerError::ResourceExhausted(_)) => {}
             Err(error) => panic!("unexpected reuse error while cleanup is claimed: {error:?}"),
             Ok(_) => panic!("new write must not replace an entry with cleanup in progress"),
@@ -1027,7 +1030,7 @@ mod tests {
                 .await
         );
         let reused = core
-            .begin_block_write(write_request(), write_rpc_permit())
+            .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse after claimed cleanup exits");
         core.abort_block_write(reused).await.expect("abort reused write");
@@ -1044,7 +1047,7 @@ mod tests {
             abort_calls,
         } = blocking_core(BlockingOperation::Abort);
         let write = core
-            .begin_block_write(write_request(), write_rpc_permit())
+            .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("begin write");
         drop(write);
@@ -1075,7 +1078,7 @@ mod tests {
                 .await
         );
         let reused = core
-            .begin_block_write(write_request(), write_rpc_permit())
+            .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse after detached cleanup exits");
         core.abort_block_write(reused).await.expect("abort reused write");
@@ -1093,11 +1096,11 @@ mod tests {
         } = blocking_core(BlockingOperation::PanicFirstAbort);
         let other_block_id = BlockId::new(InodeId::new(7), BlockIndex::new(4));
         let first = core
-            .begin_block_write(write_request(), write_rpc_permit())
+            .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("first write");
         let second = core
-            .begin_block_write(write_request_for(other_block_id), write_rpc_permit())
+            .begin_test_write(write_request_for(other_block_id), write_rpc_permit())
             .await
             .expect("second write");
         drop((first, second));
@@ -1112,12 +1115,12 @@ mod tests {
         assert_eq!(abort_calls.load(Ordering::SeqCst), 3);
 
         let first = core
-            .begin_block_write(write_request(), write_rpc_permit())
+            .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("reuse first block");
         core.abort_block_write(first).await.expect("abort first reuse");
         let second = core
-            .begin_block_write(write_request_for(other_block_id), write_rpc_permit())
+            .begin_test_write(write_request_for(other_block_id), write_rpc_permit())
             .await
             .expect("reuse second block");
         core.abort_block_write(second).await.expect("abort second reuse");
@@ -1129,7 +1132,7 @@ mod tests {
         let mut request = write_request();
         request.block_size = 3;
         let mut write = core
-            .begin_block_write(request, write_rpc_permit())
+            .begin_test_write(request, write_rpc_permit())
             .await
             .expect("begin write");
         assert!(core.write_block_data(&mut write, Bytes::new()).await.is_err());
@@ -1144,7 +1147,7 @@ mod tests {
     async fn cancelled_blocking_read_keeps_reclaim_pin_until_io_exits() {
         let (_temp, store, core) = core_with_store();
         let mut write = core
-            .begin_block_write(write_request(), write_rpc_permit())
+            .begin_test_write(write_request(), write_rpc_permit())
             .await
             .expect("begin write");
         core.write_block_data(&mut write, Bytes::from_static(b"abcdefgh"))
@@ -1184,7 +1187,6 @@ mod tests {
                 .reclaim_block(ReclaimBlockRequest {
                     group_name: group_name(),
                     block_id: block_id(),
-                    expected_block_stamp: BLOCK_STAMP,
                 })
                 .await
         });
@@ -1212,5 +1214,92 @@ mod tests {
             .expect("reclaim task")
             .is_ok());
         assert_eq!(read_slots.available_permits(), 1);
+    }
+    #[tokio::test]
+    async fn new_epoch_waits_for_old_io_and_fences_the_lingering_stream() {
+        let BlockingCoreFixture {
+            _temp,
+            store,
+            core,
+            started,
+            release,
+            ..
+        } = blocking_core(BlockingOperation::Write);
+        let mut old = core
+            .begin_test_write(write_request(), write_rpc_permit())
+            .await
+            .unwrap();
+        let old_core = core.clone();
+        let io = tokio::spawn(async move {
+            old_core
+                .write_block_data(&mut old, Bytes::from_static(b"orphan"))
+                .await
+                .unwrap();
+            old
+        });
+        tokio::task::spawn_blocking(move || started.recv().unwrap())
+            .await
+            .unwrap();
+        let mut next = write_request();
+        next.fencing_token.epoch = beryl_types::LeaseEpoch::new(56);
+        let takeover = core.begin_test_write(next, write_rpc_permit());
+        tokio::pin!(takeover);
+        assert!(futures::poll!(&mut takeover).is_pending());
+        assert_eq!(
+            core.cleanup_block_write_batch(false).await,
+            0,
+            "actual IO pins old ownership"
+        );
+        assert_eq!(
+            store
+                .load_meta(&group_name(), block_id())
+                .unwrap()
+                .visibility
+                .fencing_token
+                .epoch
+                .as_raw(),
+            55
+        );
+        release.send(()).unwrap();
+        let mut old = io.await.unwrap();
+        assert!(core
+            .write_block_data(&mut old, Bytes::from_static(b"late"))
+            .await
+            .is_err());
+        assert_eq!(core.cleanup_block_write_batch(false).await, 1);
+        let mut new = takeover.await.unwrap();
+        assert!(
+            core.finish_block_write(&mut old).await.is_err(),
+            "old EOF cannot checkpoint the new epoch"
+        );
+        core.write_block_data(&mut new, Bytes::from_static(b"new"))
+            .await
+            .unwrap();
+        core.finish_block_write(&mut new).await.unwrap();
+        assert_eq!(store.read_at(&group_name(), block_id(), 0, 3).unwrap(), b"new"[..]);
+    }
+
+    #[tokio::test]
+    async fn reclaim_fences_authorization_that_finishes_after_the_delete_gate() {
+        let (_temp, store, core) = core_with_store();
+        let request = write_request();
+        let pending_authorization = core.pin_write_authorization(&request).unwrap();
+        let reclaim = core.reclaim_block(ReclaimBlockRequest {
+            group_name: group_name(),
+            block_id: block_id(),
+        });
+        tokio::pin!(reclaim);
+        assert!(futures::poll!(&mut reclaim).is_pending());
+        assert!(core.pin_write_authorization(&request).is_err());
+        assert!(core
+            .begin_block_write(request, write_rpc_permit(), pending_authorization, 0)
+            .await
+            .is_err());
+        assert_eq!(core.cleanup_block_write_batch(false).await, 1);
+        assert_eq!(reclaim.await.unwrap(), ReclaimBlockResult::AlreadyAbsent);
+        assert!(matches!(
+            store.load_meta(&group_name(), block_id()),
+            Err(WorkerError::NotFound(_))
+        ));
     }
 }

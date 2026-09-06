@@ -24,11 +24,6 @@ pub(super) fn build_read_block_request(
     block_read: &PlannedBlockRead,
     worker: &WorkerEndpointInfo,
 ) -> ClientResult<beryl_proto::worker::ReadBlockRequestProto> {
-    if block_read.block_stamp == 0 {
-        return Err(ClientError::invalid_layout(
-            "planned block read has zero block_stamp".to_string(),
-        ));
-    }
     BlockShape::new(
         block_read.block_format_id,
         block_read.block_size,
@@ -49,7 +44,7 @@ pub(super) fn build_read_block_request(
             }
             .into(),
         ),
-        block_stamp: block_read.block_stamp,
+
         frame_size: default_frame_size(block_read.len),
         worker_run_id: worker.worker_run_id.to_string(),
         block_format_id: block_read.block_format_id.as_raw(),
@@ -77,7 +72,8 @@ pub(super) fn build_write_block_command(
                 block_format_id: target.target.block_format_id.as_raw(),
                 block_size: target.target.block_size,
                 chunk_size: target.target.chunk_size,
-                block_stamp: target.target.block_stamp,
+                fencing_token: Some(target.target.fencing_token.into()),
+                write_offset: target.target.write_offset,
                 tier: beryl_proto::common::TierProto::from(target.target.tier) as i32,
             },
         ))),
@@ -279,9 +275,9 @@ fn validate_worker_write_target(target: &WorkerWriteTarget) -> ClientResult<()> 
             "write target has no worker endpoints".to_string(),
         ));
     }
-    if target.target.block_stamp == 0 {
+    if target.target.write_offset >= target.target.block_size {
         return Err(ClientError::invalid_layout(
-            "write target block_stamp must be non-zero".to_string(),
+            "write target offset exceeds capacity".to_string(),
         ));
     }
     Ok(())

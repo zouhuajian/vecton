@@ -3,14 +3,17 @@
 
 //! Process-local ownership for active block writes.
 
+use super::block::BlockPin;
 use crate::runtime::DataRpcPermit;
 use beryl_types::ids::BlockId;
-use beryl_types::GroupName;
+use beryl_types::{FencingToken, GroupName};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
-/// Exact worker-local identity of staging state owned by one write RPC.
+/// Exact worker-local identity of write state owned by one write RPC.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BlockWriteKey {
     pub(crate) group_name: GroupName,
@@ -19,25 +22,26 @@ pub(crate) struct BlockWriteKey {
 
 struct BlockWriteEntry {
     io: Mutex<BlockWriteIoState>,
-    /// Retained until Ready completion or successful cleanup removes this entry.
-    _rpc_permit: DataRpcPermit,
+    token: FencingToken,
+    retired: CancellationToken,
 }
 
 impl BlockWriteEntry {
-    fn new(rpc_permit: DataRpcPermit) -> Self {
+    fn new(rpc_permit: DataRpcPermit, token: FencingToken, block_pin: BlockPin) -> Self {
         Self {
             io: Mutex::new(BlockWriteIoState {
-                retiring: false,
                 inflight: 0,
                 cleanup_running: false,
+                resources: Some((block_pin, rpc_permit)),
             }),
-            _rpc_permit: rpc_permit,
+            retired: CancellationToken::new(),
+            token,
         }
     }
 
     fn begin_io(self: &Arc<Self>) -> Option<BlockWriteIoGuard> {
         let mut io = self.io.lock();
-        if io.retiring {
+        if self.retired.is_cancelled() {
             return None;
         }
         io.inflight += 1;
@@ -47,15 +51,16 @@ impl BlockWriteEntry {
     }
 
     fn retire(&self) {
-        self.io.lock().retiring = true;
+        let _io = self.io.lock();
+        self.retired.cancel();
     }
 
     fn retire_and_claim_cleanup(&self, drain: bool) -> bool {
         let mut io = self.io.lock();
         if drain {
-            io.retiring = true;
+            self.retired.cancel();
         }
-        if !io.retiring || io.inflight != 0 || io.cleanup_running {
+        if !self.retired.is_cancelled() || io.inflight != 0 || io.cleanup_running {
             return false;
         }
         io.cleanup_running = true;
@@ -70,9 +75,10 @@ impl BlockWriteEntry {
 }
 
 struct BlockWriteIoState {
-    retiring: bool,
     inflight: usize,
     cleanup_running: bool,
+    // Cleanup releases admission even if transport backpressure retains the old RPC.
+    resources: Option<(BlockPin, DataRpcPermit)>,
 }
 
 struct BlockWriteRegistryState {
@@ -80,10 +86,11 @@ struct BlockWriteRegistryState {
     cleanup_order: VecDeque<BlockWriteKey>,
 }
 
-/// Prevents concurrent RPCs from owning the same staging block and retains
+/// Prevents concurrent RPCs from owning the same block write and retains
 /// cancelled writes until process-owned cleanup releases their local files.
 pub(crate) struct BlockWriteRegistry {
     inner: Mutex<BlockWriteRegistryState>,
+    changed: Notify,
 }
 
 /// RPC-owned registration. Dropping it before completion schedules cleanup
@@ -96,6 +103,11 @@ pub(crate) struct BlockWriteRegistration {
 }
 
 impl BlockWriteRegistration {
+    /// Wakes idle streams when takeover, reclamation, or shutdown stops their IO.
+    pub(crate) async fn retired(&self) {
+        self.entry.retired.cancelled().await;
+    }
+
     /// Acquires an IO lease that keeps cleanup behind a detached blocking task.
     pub(crate) fn begin_io(&self) -> Option<BlockWriteIoGuard> {
         self.entry.begin_io()
@@ -161,6 +173,7 @@ impl Drop for RetiringBlockWrite {
 impl BlockWriteRegistry {
     pub(crate) fn new() -> Self {
         Self {
+            changed: Notify::new(),
             inner: Mutex::new(BlockWriteRegistryState {
                 writes: HashMap::new(),
                 cleanup_order: VecDeque::new(),
@@ -168,26 +181,47 @@ impl BlockWriteRegistry {
         }
     }
 
-    /// Acquires exclusive process-local ownership without replacing an active
-    /// write for the same group and block.
-    pub(crate) fn register(
+    /// A newer authorized writer retires the old stream and waits for its actual IO and cleanup.
+    /// Same-epoch overlap is rejected; persisted tokens fence delayed requests after entries disappear.
+    pub(crate) async fn register(
         self: &Arc<Self>,
         key: BlockWriteKey,
         rpc_permit: DataRpcPermit,
+        token: FencingToken,
+        block_pin: BlockPin,
     ) -> Option<BlockWriteRegistration> {
-        let mut inner = self.inner.lock();
-        if inner.writes.contains_key(&key) {
-            return None;
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut inner = self.inner.lock();
+                if let Some(entry) = inner.writes.get(&key) {
+                    if token.epoch <= entry.token.epoch {
+                        return None;
+                    }
+                    entry.retire();
+                } else {
+                    let entry = Arc::new(BlockWriteEntry::new(rpc_permit, token, block_pin));
+                    inner.writes.insert(key.clone(), Arc::clone(&entry));
+                    inner.cleanup_order.push_back(key.clone());
+                    return Some(BlockWriteRegistration {
+                        registry: Arc::clone(self),
+                        key,
+                        entry,
+                        completed: false,
+                    });
+                }
+            }
+            notified.await;
         }
-        let entry = Arc::new(BlockWriteEntry::new(rpc_permit));
-        inner.writes.insert(key.clone(), Arc::clone(&entry));
-        inner.cleanup_order.push_back(key.clone());
-        Some(BlockWriteRegistration {
-            registry: Arc::clone(self),
-            key,
-            entry,
-            completed: false,
-        })
+    }
+
+    /// Stops admitting IO before reclamation waits for the block's access pins.
+    pub(crate) fn retire(&self, key: &BlockWriteKey) {
+        if let Some(entry) = self.inner.lock().writes.get(key) {
+            entry.retire();
+        }
     }
 
     /// Selects and atomically claims at most one bounded batch. Normal passes
@@ -240,13 +274,21 @@ impl BlockWriteRegistry {
         {
             return false;
         }
-        if entry.io.lock().cleanup_running {
+        let mut io = entry.io.lock();
+        if io.cleanup_running {
             return false;
         }
+        debug_assert_eq!(io.inflight, 0);
+        entry.retired.cancel();
+        let resources = io.resources.take();
+        drop(io);
         inner.writes.remove(key);
+        self.changed.notify_waiters();
         if let Some(position) = inner.cleanup_order.iter().position(|queued| queued == key) {
             inner.cleanup_order.remove(position);
         }
+        drop(inner);
+        drop(resources);
         true
     }
 
@@ -259,10 +301,18 @@ impl BlockWriteRegistry {
         {
             return false;
         }
+        let mut io = entry.io.lock();
+        debug_assert_eq!(io.inflight, 0);
+        entry.retired.cancel();
+        let resources = io.resources.take();
+        drop(io);
         inner.writes.remove(key);
+        self.changed.notify_waiters();
         if let Some(position) = inner.cleanup_order.iter().position(|queued| queued == key) {
             inner.cleanup_order.remove(position);
         }
+        drop(inner);
+        drop(resources);
         true
     }
 }
@@ -288,16 +338,61 @@ mod tests {
         DataRpcPermit::new(slots.try_acquire_owned().expect("test write capacity"), "write")
     }
 
-    #[test]
-    fn cancellation_retires_exact_owner_and_allows_reuse_after_cleanup() {
+    async fn register(registry: &Arc<BlockWriteRegistry>) -> Option<super::BlockWriteRegistration> {
+        let key = key();
+        let pin = crate::runtime::block::BlockManager::default()
+            .pin_block(&key.group_name, key.block_id)
+            .unwrap();
+        let token = beryl_types::FencingToken::new(
+            key.block_id,
+            beryl_types::ClientId::new(9),
+            beryl_types::LeaseEpoch::new(1),
+        );
+        registry.register(key, rpc_permit(), token, pin).await
+    }
+
+    #[tokio::test]
+    async fn cancellation_retires_exact_owner_and_allows_reuse_after_cleanup() {
         let registry = Arc::new(BlockWriteRegistry::new());
-        let registration = registry.register(key(), rpc_permit()).expect("first owner");
-        assert!(registry.register(key(), rpc_permit()).is_none());
+        let registration = register(&registry).await.expect("first owner");
+        assert!(register(&registry).await.is_none());
 
         drop(registration);
         let candidates = registry.take_cleanup_batch(1, false);
         assert_eq!(candidates.len(), 1);
         assert!(candidates.into_iter().next().expect("cleanup claim").complete());
-        assert!(registry.register(key(), rpc_permit()).is_some());
+        assert!(register(&registry).await.is_some());
+
+        let registry = Arc::new(BlockWriteRegistry::new());
+        let manager = crate::runtime::block::BlockManager::default();
+        let slots = Arc::new(Semaphore::new(1));
+        let key = key();
+        let owner = registry
+            .register(
+                key.clone(),
+                DataRpcPermit::new(Arc::clone(&slots).try_acquire_owned().unwrap(), "write"),
+                beryl_types::FencingToken::new(
+                    key.block_id,
+                    beryl_types::ClientId::new(9),
+                    beryl_types::LeaseEpoch::new(1),
+                ),
+                manager.pin_block(&key.group_name, key.block_id).unwrap(),
+            )
+            .await
+            .unwrap();
+        let io = owner.begin_io().unwrap();
+        let reclaim = manager.begin_reclaim(&key.group_name, key.block_id).unwrap();
+        registry.retire(&key);
+        assert!(owner.begin_io().is_none());
+        assert!(registry.take_cleanup_batch(1, false).is_empty());
+        assert_eq!(slots.available_permits(), 0);
+        drop(io);
+        assert!(registry.take_cleanup_batch(1, false).pop().unwrap().complete());
+        // The old RPC is retained and never polled or dropped while cleanup releases its resources.
+        assert!(futures::poll!(std::pin::pin!(reclaim.wait_for_pins())).is_ready());
+        assert_eq!(slots.available_permits(), 1);
+        assert!(owner.begin_io().is_none());
+        reclaim.complete();
+        assert!(manager.pin_block(&key.group_name, key.block_id).is_ok());
     }
 }

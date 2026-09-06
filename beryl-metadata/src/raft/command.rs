@@ -4,12 +4,12 @@
 //! Metadata authority commands replicated through Raft.
 
 use crate::inode::FilePublication;
+use crate::inode::InodeAttrs;
 pub(crate) use crate::inode::PublishMode;
 use crate::session_registry::CreateFileOperationId;
-use beryl_types::fs::{Extent, FileAttrs};
 use beryl_types::ids::{InodeId, MountId, WorkerId};
 use beryl_types::layout::FileLayout;
-use beryl_types::{CallId, ClientId, ContentGeneration, GroupName, LeaseEpoch};
+use beryl_types::{CallId, ClientId, GroupName, LeaseEpoch};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,7 +39,7 @@ pub(crate) enum Command {
         proposed_at_ms: u64,
         root_inode_id: InodeId,
         components: Vec<String>,
-        attrs: FileAttrs,
+        attrs: InodeAttrs,
         recursive: bool,
     },
     CreateFile {
@@ -52,7 +52,7 @@ pub(crate) enum Command {
         expected_mount_epoch: u64,
         mount_root_inode_id: InodeId,
         relative_components: Vec<String>,
-        attrs: FileAttrs,
+        attrs: InodeAttrs,
         layout: FileLayout,
     },
     /// Delete one exact mount-relative target after revalidating its path.
@@ -97,12 +97,7 @@ pub(crate) enum Command {
     PublishFile {
         proposed_at_ms: u64,
         inode_id: InodeId,
-        extents: Vec<Extent>,
-        target_size: u64,
-        expected_generation: ContentGeneration,
-        expected_file_size: u64,
-        lease_epoch: LeaseEpoch,
-        mode: PublishMode,
+        publication: FilePublication,
     },
     /// Publish content, end the exact writer epoch, and record completion atomically.
     CommitFile {
@@ -163,19 +158,16 @@ pub(crate) fn proposal_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beryl_types::{BlockId, BlockIndex, MAX_FILE_EXTENTS};
+    use beryl_types::{BlockId, BlockIndex, CommittedBlock, ContentGeneration, MAX_FILE_BLOCKS};
 
     #[test]
     fn maximum_commit_file_command_fits_command_limit() {
         let inode_id = InodeId::new(u64::MAX);
-        let extents = (0..MAX_FILE_EXTENTS)
-            .map(|index| Extent {
-                file_offset: u64::MAX,
+        let blocks = (0..MAX_FILE_BLOCKS)
+            .map(|index| CommittedBlock {
                 block_id: BlockId::new(inode_id, BlockIndex::new(index as u32)),
-                block_offset: u64::MAX,
+
                 len: u64::MAX,
-                generation: Some(ContentGeneration::new(u64::MAX)),
-                block_stamp: Some(u64::MAX),
             })
             .collect();
         let command = Command::CommitFile {
@@ -184,7 +176,7 @@ mod tests {
             client_id: ClientId::new(u128::MAX),
             call_id: CallId::new(),
             publication: FilePublication {
-                extents,
+                blocks,
                 target_size: u64::MAX,
                 expected_generation: ContentGeneration::new(u64::MAX),
                 expected_file_size: u64::MAX,

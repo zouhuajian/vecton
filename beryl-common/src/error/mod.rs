@@ -69,7 +69,6 @@ pub mod rpc {
         DescriptorMismatch,
         FullReportRequired,
         BlockLocationUnavailable,
-        BlockStampMismatch,
         NodeUnavailable,
         Timeout,
         ResourceExhausted,
