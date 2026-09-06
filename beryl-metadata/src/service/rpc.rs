@@ -39,43 +39,6 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
-/// Attaches the common response envelope without duplicating field access in handlers.
-trait HeaderResponse {
-    fn with_header(self, header: ResponseHeaderProto) -> Self;
-}
-
-macro_rules! impl_header_response {
-    ($($resp_ty:ty),+ $(,)?) => {
-        $(
-            impl HeaderResponse for $resp_ty {
-                fn with_header(mut self, header: ResponseHeaderProto) -> Self {
-                    self.header = Some(header);
-                    self
-                }
-            }
-        )+
-    };
-}
-
-impl_header_response!(
-    AuthorizeBlockWriteResponseProto,
-    GetStatusResponseProto,
-    ListStatusResponseProto,
-    CreateDirectoryResponseProto,
-    DeleteResponseProto,
-    RenameResponseProto,
-    OpenFileResponseProto,
-    GetBlockLocationsResponseProto,
-    CreateFileResponseProto,
-    OpenWriteResponseProto,
-    AllocateBlockResponseProto,
-    CommitFileResponseProto,
-    AbortFileWriteResponseProto,
-    RenewLeaseResponseProto,
-    SyncWriteResponseProto,
-    MsyncResponseProto,
-);
-
 /// Unary gRPC adapter that validates wire requests before entering metadata authority.
 pub struct MetadataFileSystemServiceImpl {
     filesystem: Arc<MetadataFileSystem>,
@@ -85,7 +48,9 @@ pub struct MetadataFileSystemServiceImpl {
 
 macro_rules! response_with_header {
     ($resp:expr, $header:expr) => {{
-        Ok(Response::new(HeaderResponse::with_header($resp, $header)))
+        let mut response = $resp;
+        response.header.replace($header);
+        Ok(Response::new(response))
     }};
 }
 
@@ -909,13 +874,16 @@ mod tests {
     use crate::state::{RouteEpoch, StateStore};
     use crate::worker::{BlockReportBlock, BlockReportBlockState, WorkerManager};
     use crate::MetadataResult;
-    use beryl_common::error::rpc::{ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RpcErrorDetail};
+    use beryl_common::error::rpc::{
+        ErrorKind, MetadataErrorKind, ProtocolErrorKind, RecoveryAction, RefreshHint, RpcErrorDetail,
+    };
     use beryl_common::header::RequestHeader;
     use beryl_proto::common::{ErrorDetailProto, RequestHeaderProto, ResponseHeaderProto};
     use beryl_proto::metadata::file_system_service_proto_server::FileSystemServiceProto;
     use beryl_proto::metadata::{
-        AllocateBlockRequestProto, CommitFileRequestProto, CommittedBlockProto, CreateFileRequestProto,
-        OpenWriteModeProto, SyncWriteRequestProto, WriteHandleProto,
+        AllocateBlockRequestProto, AllocateBlockResponseProto, CommitFileRequestProto, CommittedBlockProto,
+        CreateFileRequestProto, GetStatusRequestProto, GetStatusResponseProto, OpenWriteModeProto,
+        SyncWriteRequestProto, WriteHandleProto,
     };
 
     use beryl_types::ids::{BlockId, BlockIndex, InodeId, MountId, WorkerId};
@@ -1210,6 +1178,73 @@ mod tests {
         };
 
         (write_handle, committed, expected_generation, write_mode)
+    }
+
+    #[tokio::test]
+    async fn rpc_errors_preserve_headers_and_recovery_hints() {
+        let env = write_env().await;
+        for (request_header, expected_kind) in [
+            (None, ProtocolErrorKind::InvalidHeader),
+            (header(61), ProtocolErrorKind::InvalidArgument),
+        ] {
+            let expected_client = request_header.as_ref().and_then(|header| header.client.clone());
+            let mut response = env
+                .service
+                .allocate_block(Request::new(AllocateBlockRequestProto {
+                    header: request_header,
+                    write_handle: None,
+                    previous_block_id: None,
+                }))
+                .await
+                .expect("transport status must remain OK")
+                .into_inner();
+            let response_header = response.header.take().expect("response header");
+            assert_eq!(response_header.client, expected_client);
+            assert_fail_kind(
+                &response_header.error.expect("business error"),
+                ErrorKind::Protocol(expected_kind),
+            );
+            assert_eq!(response, AllocateBlockResponseProto::default());
+        }
+
+        let request_header = RequestHeaderProto {
+            route_epoch: Some(0),
+            ..header(62).unwrap()
+        };
+        let mut response = env
+            .service
+            .get_status(Request::new(GetStatusRequestProto {
+                header: Some(request_header.clone()),
+                path: "/mnt/test".to_string(),
+            }))
+            .await
+            .expect("transport status must remain OK")
+            .into_inner();
+        let mut response_header = response.header.take().expect("response header");
+        let error = rpc_error(&response_header.error.take().expect("business error"));
+        assert_eq!(error.kind, ErrorKind::Metadata(MetadataErrorKind::RouteEpochMismatch));
+        assert_eq!(
+            error.recovery,
+            RecoveryAction::RefreshMetadata {
+                hint: RefreshHint {
+                    group_name: Some("root".to_string()),
+                    mount_epoch: Some(1),
+                    route_epoch: Some(1),
+                    ..Default::default()
+                }
+            }
+        );
+        assert_eq!(
+            response_header,
+            ResponseHeaderProto {
+                client: request_header.client,
+                group_name: "root".to_string(),
+                mount_epoch: Some(1),
+                route_epoch: Some(1),
+                ..Default::default()
+            }
+        );
+        assert_eq!(response, GetStatusResponseProto::default());
     }
 
     #[tokio::test]
