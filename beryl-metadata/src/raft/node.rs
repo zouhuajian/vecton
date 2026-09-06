@@ -19,6 +19,7 @@ use openraft::{Config, Raft, RaftMetrics, RaftTypeConfig, ServerState, SnapshotP
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 
 /// Raft node ID type.
@@ -30,6 +31,7 @@ pub(crate) struct AppRaftNode {
     raft: Arc<Raft<MetadataRaftTypeConfig>>,
     state_machine: Arc<AppStateMachine>,
     read_view: Arc<MetadataReadView>,
+    storage_tasks: TaskTracker,
 }
 
 impl AppRaftNode {
@@ -60,12 +62,14 @@ impl AppRaftNode {
         );
 
         // Create RaftStateMachine (storage-v2)
+        let storage_tasks = TaskTracker::new();
         let sm_store = StateMachineStorage::new_with_tracker(
             Arc::clone(&storage),
             Arc::clone(&state_machine),
             Arc::clone(&raft_state),
             Arc::clone(&read_view),
             snapshot_install,
+            storage_tasks.token(),
         )?;
 
         // Create NetworkFactory
@@ -105,6 +109,7 @@ impl AppRaftNode {
             raft: Arc::new(raft),
             state_machine,
             read_view,
+            storage_tasks,
         };
         node.record_current_raft_metrics();
         Ok(node)
@@ -246,7 +251,11 @@ impl AppRaftNode {
         self.raft
             .shutdown()
             .await
-            .map_err(|e| MetadataError::Internal(format!("Failed to shutdown Raft node: {e}")))
+            .map_err(|e| MetadataError::Internal(format!("Failed to shutdown Raft node: {e}")))?;
+        // OpenRaft 0.9 joins RaftCore, but not its state-machine worker or snapshot tasks.
+        self.storage_tasks.close();
+        self.storage_tasks.wait().await;
+        Ok(())
     }
 
     pub(crate) fn route_epoch(&self) -> crate::state::RouteEpoch {
@@ -337,6 +346,35 @@ mod tests {
     use crate::state::{RaftStateStore, RouteEpoch, StateStore};
     use beryl_types::{GroupName, WorkerId};
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn shutdown_releases_storage_before_immediate_reopen() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(RocksDBStorage::create_for_format(dir.path()).unwrap());
+        let released = Arc::downgrade(&storage);
+        let node = AppRaftNode::new(
+            1,
+            Arc::clone(&storage),
+            Arc::new(AppStateMachine::new(Arc::clone(&storage))),
+            Arc::new(MountTable::new()),
+            &RaftConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), node.shutdown())
+            .await
+            .expect("Raft shutdown must finish")
+            .unwrap();
+        drop(node);
+        drop(storage);
+
+        assert!(
+            released.upgrade().is_none(),
+            "shutdown must release background storage owners"
+        );
+        RocksDBStorage::open_existing_for_start(dir.path()).expect("storage must reopen without retry");
+    }
 
     #[tokio::test]
     async fn applied_and_route_epoch_reads_do_not_hit_rocksdb() {

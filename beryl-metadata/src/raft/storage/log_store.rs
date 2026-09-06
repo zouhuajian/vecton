@@ -460,8 +460,15 @@ mod tests {
                 MetadataReadView::new(Arc::new(MountTable::new()), Arc::clone(&state), Arc::clone(&storage))
                     .expect("create metadata read view"),
             );
-            let sm = StateMachineStorage::new_with_tracker(storage, app, state, read_view, snapshot_install)
-                .expect("create OpenRaft state-machine store");
+            let sm = StateMachineStorage::new_with_tracker(
+                storage,
+                app,
+                state,
+                read_view,
+                snapshot_install,
+                tokio_util::task::TaskTracker::new().token(),
+            )
+            .expect("create OpenRaft state-machine store");
             Ok((dir, log, sm))
         }
     }
